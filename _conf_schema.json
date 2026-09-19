@@ -1,17 +1,27 @@
 {
-  "filter_enabled": {
-    "description": "只对匹配的提供商注入（默认关闭）",
-    "type": "bool",
-    "default": false,
-    "hint": "关闭（默认）：对所有 OpenAI 兼容的提供商都注入该头，最不容易出错——请求经自建中转时，按地址筛选会静默失效。开启：只有「提供商 ID、提供商类型、或 base_url」中包含下面任一关键字的提供商才会被注入，其它提供商一律不加。"
+  "match_mode": {
+    "description": "按哪个字段匹配提供商",
+    "type": "string",
+    "default": "base_url",
+    "options": [
+      "base_url",
+      "provider_id",
+      "provider_type"
+    ],
+    "labels": [
+      "按 base_url（默认）",
+      "按提供商 ID",
+      "按提供商类型"
+    ],
+    "hint": "选择用哪个字段去匹配下面的关键字，三选一，只比这一个字段。base_url：提供商配置里的地址（严格；若请求经过你自己的中转，地址是内网 IP、与上游域名无关，会匹配不到）。provider_id：形如 opencode/deepseek-v4-flash，经过中转时通常仍带 opencode，**走自建中转请选这项**。provider_type：形如 chat_completion。"
   },
   "host_keywords": {
-    "description": "匹配关键字（仅在开启筛选时生效）",
+    "description": "匹配关键字",
     "type": "list",
     "default": [
       "opencode"
     ],
-    "hint": "依次在提供商 ID、提供商类型、base_url 中查找，不区分大小写，命中任意一个即可。注意：请求若经过你自己的中转，base_url 常是内网地址、与上游域名无关，但提供商 ID（如 opencode/deepseek-v4-flash）通常仍能匹配上。"
+    "hint": "在上面选定的字段中查找这些关键字（不区分大小写），命中任意一个即注入该头。**留空表示不筛选，对所有提供商都注入。**"
   },
   "target_header": {
     "description": "注入的请求头名称",

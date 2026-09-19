@@ -186,21 +186,21 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 
 | 配置项 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `filter_enabled` | 布尔 | **`false`** | 是否只对「匹配的提供商」注入。**默认关闭 = 对所有 OpenAI 兼容的提供商都注入**，开箱即用、不会静默失效。 |
-| `host_keywords` | 字符串列表 | `["opencode"]` | 仅在开启筛选时生效。依次在**提供商 ID、提供商类型、base_url** 中查找（不区分大小写），命中任意一个即注入。留空 = 不筛选（等于关闭）。 |
+| `match_mode` | 下拉单选 | **`base_url`** | 用哪个字段去匹配关键字，三选一：`base_url`（提供商地址）/ `provider_id`（提供商 ID）/ `provider_type`（提供商类型）。 |
+| `host_keywords` | 字符串列表 | `["opencode"]` | 在选定字段中查找这些关键字（不区分大小写），命中任意一个即注入。**留空 = 不筛选，对所有提供商都注入。** |
 | `target_header` | 字符串 | `X-Opencode-Session` | 注入的请求头名称。除非对接别的兼容网关，否则不要改。 |
 
-**为什么默认不筛选**：这个头对非 OpenCode 的服务是无害的自定义头。反过来，一旦按地址筛选，**请求经自建中转时就会静默失效**——因为中转的内网地址（如 `http://10.0.0.3:3335/v1`）与上游域名毫无关系，匹配不上，头就不发了，而上游会直接返回 `400 MissingSessionID`。这类失效很难排查（插件看起来加载正常、日志也没有报错），所以默认不开。
+**三种匹配方式怎么选**：
 
-**想收窄时怎么配**（把 `filter_enabled` 打开）：
+| `match_mode` | 比较的字段 | 例子 | 什么时候用 |
+| --- | --- | --- | --- |
+| `base_url`（默认） | 提供商配置里的地址 | `https://opencode.ai/zen/go/v1` | 直连官方，或中转地址里就带 `opencode` |
+| **`provider_id`** | 提供商 ID | `opencode/deepseek-v4-flash` | **走自建中转请选这项** |
+| `provider_type` | 提供商类型 | `chat_completion` | 极少用，按类型批量匹配 |
 
-| 你的情况 | 匹配结果 |
-| --- | --- |
-| 提供商 ID 形如 `opencode/xxx`、`opencode-go-compatible/xxx` | 命中（**这就是走自建中转的典型情况**） |
-| `base_url` 含 `opencode`（如 `https://opencode.ai/zen/go/v1`） | 命中 |
-| `base_url` 是你自己的中转、且提供商 ID 里也没有 opencode | **不命中** —— 把中转域名（或其中一段）加进 `host_keywords` |
+**为什么 `provider_id` 这一项很关键**：请求经过你自己的中转时，`base_url` 往往是内网地址（如 `http://10.0.0.3:3335/v1`），与上游域名毫无关系——用 `base_url` 匹配**必然失败**，头就不发了，而上游会直接返回 `400 MissingSessionID`。这种失效是静默的（插件加载正常、日志无报错），很难排查。改用 `provider_id` 后，`opencode/xxx` 这样的名字仍能命中。
 
-> 匹配范围包含**提供商 ID**，这一点很关键：请求经过你自己的中转时 URL 匹配不上，但提供商 ID 通常仍带着 `opencode`，所以筛选依然能正确识别。
+**如果拿不准**：把 `host_keywords` 清空即可（不筛选、全部注入），一定不会漏。
 
 配置写入 `data/config/astrbot_plugin_opencode_session_config.json`。
 
@@ -262,7 +262,7 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 - **不代替 API Key 与 UA 配置**：插件只负责会话标识，上游要求的其余头（尤其是 `user-agent`）仍需你自行在 provider 配置中补齐。
 - **会话标识取不到时省略该头**：当三个会话键来源全部为空、取不到可用会话标识时，插件会**省略**该头（不注入），并且**不会**退化成某个固定常量值。这是刻意设计：宁可少发一个头，也不让所有异常请求共用一个 ID——后者既没有缓存收益，又会制造上游风控特征。
 - **大小写不宽容**：`custom_headers` 中该头必须使用规范大小写 `X-Opencode-Session`；写成其它形式会出站重复头、覆盖结果未定义（见第 2.1 节）。
-- **注入范围可选筛选**：默认对**所有** OpenAI 兼容的提供商注入（见第 4.3 节）。若你开启了 `filter_enabled` 而没有把中转域名加进关键字，会表现为「该头整个缺失」——这是最容易踩的坑。反过来，默认的「全注入」会把同一个头也发给别的提供商（对该头无意义，通常无害）。
+- **注入范围按 `match_mode` 匹配**：默认按 `base_url` 匹配 `opencode`（见第 4.3 节）。**走自建中转时必须改成 `provider_id`**，否则中转的内网地址匹配不上、该头整个缺失，上游会返回 `400 MissingSessionID`。若拿不准就把 `host_keywords` 清空（全部注入）。
 
 ---
 
@@ -278,8 +278,8 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | WebUI 点「测试」报 `400 MissingSessionID`，但对话正常 | v1.0.0 的已知缺陷：模型列表走的是 `client.models.list()`，早期版本未包装该路径。**升级到 v1.0.1 或更高**即可。 |
 | 头存在，但值总是同一个 | 检查是否在 `custom_headers` 里写死了 `X-Opencode-Session`（见第 2 节）。在**规范大小写**下插件会在出站时无条件覆盖该头，所以正常情况下你看到的不会是写死的那串；如果看到的恰好就是写死值，说明插件没有加载成功、注入链路没生效，或该头被写成了非规范大小写（见下一行），请先按规范大小写配置或直接删掉该配置项后重来。 |
 | 插件装了但缓存亲和性没效果 / 抓包看到重复的 session 头 | `custom_headers` 中该头使用了**非规范大小写**（如 `x-opencode-session`、`X-OPENCODE-SESSION`），导致 SDK 精确键合并不上、出站出现两个头（实测值形如 `['HARDCODED', 'cid-lower']`）。此时**插件无法保证覆盖成功、结果未定义**：插件的值在写死值之后，但上游取首值还是末值取决于实现（httpx 标量取末值，许多反向代理 / 服务端**取首值**）。处理：改为规范大小写 `X-Opencode-Session`，或从 `custom_headers` 中删除该配置项。插件会就此打一条英文 warning（每个 provider 实例最多一次），但不会替你改配置。 |
-| 抓包发现该头整个缺失（不是重复） | 两种情况，按可能性排序：①你**开启了 `filter_enabled`** 而该 provider 的 ID / 类型 / base_url 都不匹配 `host_keywords`（自建中转最常见的坑，见第 4.3 节）；②本次请求三个会话键来源全为空，插件按设计**省略**该头（见第 7 节）。排查时先看插件日志：不匹配会留下 debug 级记录。 |
-| 某些插件调用 LLM 报 `400 MissingSessionID`，但主对话正常 | 说明报错的那个 provider 没被注入。默认全注入时不应出现；请检查是否开启了 `filter_enabled`、且该 provider 不在关键字范围内。 |
+| 抓包发现该头整个缺失（不是重复） | 两种情况，按可能性排序：①`match_mode` 选的是 `base_url` 而该 provider 的地址不匹配 `host_keywords`（**走自建中转最常见的坑**，改成 `provider_id` 即可，见第 4.3 节）；②本次请求三个会话键来源全为空，插件按设计**省略**该头（见第 7 节）。插件日志会以 debug 级记录匹配用的字段与值，一看即知。 |
+| 某些插件调用 LLM 报 `400 MissingSessionID`，但主对话正常 | 同上：报错的那个 provider 没被注入。把 `match_mode` 改成 `provider_id`，或清空 `host_keywords`。 |
 | 头存在，但值每次都在变 | 确认它是否等于当前对话链的 `cid`；若你用的是「每次请求都新建会话」的调用方式，会话粒度本身就是新的。 |
 | 上游返回 401 / 403 / 被拦截 | 多半与 session 无关：优先检查 API Key、`api_base`，以及 `user-agent` 是否设置成了常见 agent 工具的值（见第 4.1 节）。 |
 | 上游报会话标识相关错误 | 确认头值非空；本插件产出的 UUID 形态取值符合上游目前的校验，若报错请记录完整请求头与上游响应以便定位。 |
@@ -311,7 +311,7 @@ astrbot_plugin_opencode_session/
 | --- | --- |
 | `tests/test_injection.py` | 注入 / 并发隔离 / 幂等 / 覆盖与告警（30 项） |
 | `tests/test_fallback.py` | 会话键回退链与防退化（21 项），含负向对照复现步骤 |
-| `tests/test_host_filter.py` | 注入范围筛选与 WebUI 配置（28 项） |
+| `tests/test_host_filter.py` | 匹配模式与 WebUI 配置（35 项） |
 | `REQUIREMENTS.md` | 冻结的接口契约（每条结论带 AstrBot `file:line`） |
 | `VERIFICATION.md` | 独立验证记录（含负向对照与裁决） |
 
@@ -335,7 +335,7 @@ uv run --no-project python astrbot_plugin_opencode_session/tests/test_host_filte
 | --- | --- | --- | --- |
 | `test_injection.py` | 30 | 30 PASS / exit 0 | 会话键取值与注入、并发不串台、包装幂等、规范大小写覆盖、非规范大小写只告警不改配置、`client._custom_headers` 前后全等 |
 | `test_fallback.py` | 21 | 21 PASS / exit 0 | 三级回退链、三来源全空时省略头且不退化为常量、无落盘状态、钩子外兜底路径 |
-| `test_host_filter.py` | 28 | 28 PASS / exit 0 | **默认对所有提供商注入**、开关打开后按「提供商 ID / 类型 / URL」匹配、中转场景下靠提供商 ID 命中、自定义关键字、大小写不敏感、关键字留空不失效、`models.list` 包装与无会话时的兜底、**会话路径仍严格遵守「无身份不发头」**、`_conf_schema.json` 结构 |
+| `test_host_filter.py` | 35 | 35 PASS / exit 0 | 默认 `base_url` 模式、三种模式各自的命中与跳过、**中转场景下 `provider_id` 模式命中**、模式非法时回退 `base_url`、大小写不敏感、关键字留空不失效、`models.list` 包装与无会话时的兜底、**会话路径仍严格遵守「无身份不发头」**、`target_header` 可配、`_conf_schema.json` 结构 |
 
 关于测试可信度：`test_injection.py` / `test_fallback.py` 做过**负向对照**——把 `main.py` 复制一份、故意注入缺陷后重跑，确认测试会失败且失败项精确对应缺陷（而不是"永远全绿"）。复现步骤与实测数字写在 `test_fallback.py` 的模块 docstring 里。注意两套测试的检测范围并不重合（前者能抓覆盖缺陷、后者不能），所以**都要跑**；`test_host_filter.py` 覆盖的是注入范围与配置，与上述两者同样不重合。
 

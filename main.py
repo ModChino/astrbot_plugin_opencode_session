@@ -49,8 +49,9 @@ separate headers instead of an override.
 # installs are module level too, and they must observe config changes without
 # re-installing anything.
 TARGET_HEADER: str = HEADER_NAME
-FILTER_ENABLED: bool = False
+MATCH_MODE: str = "base_url"
 HOST_KEYWORDS: tuple[str, ...] = ("opencode",)
+MATCH_MODES: tuple[str, ...] = ("base_url", "provider_id", "provider_type")
 
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
@@ -227,47 +228,47 @@ def _resource_url(holder: Any) -> str:
     return str(url).lower() if url is not None else ""
 
 
-def _provider_identity_strings(provider: Any, holder: Any) -> tuple[str, ...]:
-    """Collect the strings a keyword may match against for one provider.
+def _match_candidate(provider: Any, holder: Any) -> str:
+    """Return the single string the configured ``MATCH_MODE`` compares against.
 
-    Both the provider's own identity and its URL are searched, because a request
-    frequently goes through a self-hosted relay: the provider may be named
-    ``opencode/...`` while its ``api_base`` is a LAN address with no
-    relationship to the upstream domain. Matching on the URL alone silently
-    misses that case.
+    The mode picks one field only, so the behaviour stays predictable:
+
+    - ``base_url`` (default): the provider's configured URL. This is the strict
+      choice; note it cannot match a request routed through a self-hosted relay,
+      whose URL is a LAN address unrelated to the upstream domain.
+    - ``provider_id``: the provider's ID, e.g. ``opencode/deepseek-v4-flash``.
+      This is what still carries the upstream name when a relay is in front.
+    - ``provider_type``: the provider's type, e.g. ``chat_completion``.
 
     Args:
         provider: Provider instance owning the client.
         holder: Object owning the wrapped callable.
 
     Returns:
-        Lower-cased candidate strings, most specific first.
+        The lower-cased candidate string, or "" when it cannot be read.
     """
-    candidates: list[str] = []
-    try:
-        meta_id = getattr(provider.meta(), "id", None)
-        if meta_id:
-            candidates.append(str(meta_id))
-    except Exception:
-        pass
-    try:
-        provider_type = getattr(provider.meta(), "provider_type", None)
-        if provider_type:
-            candidates.append(str(provider_type))
-    except Exception:
-        pass
-    candidates.append(type(provider).__name__)
-    candidates.append(_resource_url(holder))
-    return tuple(item.lower() for item in candidates if item)
+    if MATCH_MODE == "provider_id":
+        try:
+            value = getattr(provider.meta(), "id", None)
+        except Exception:
+            value = None
+    elif MATCH_MODE == "provider_type":
+        try:
+            value = getattr(provider.meta(), "provider_type", None)
+        except Exception:
+            value = None
+    else:
+        value = _resource_url(holder)
+    return str(value).lower() if value else ""
 
 
 def _should_inject(provider: Any, holder: Any) -> bool:
     """Decide whether the header belongs on this provider's requests.
 
-    Filtering is opt-in: with ``filter_enabled`` off, every OpenAI-compatible
-    provider is injected. This default is deliberate. Gating on a URL keyword
-    silently disables the plugin's only job when a request is routed through a
-    relay, which is exactly the failure mode that made the plugin appear broken.
+    Matching is an AND of two independent conditions: a keyword list that is not
+    empty, and the configured mode's field containing one of those keywords. An
+    empty keyword list means "no filter", so clearing it can never silently
+    disable injection.
 
     Args:
         provider: Provider instance owning the client.
@@ -276,13 +277,12 @@ def _should_inject(provider: Any, holder: Any) -> bool:
     Returns:
         True when the header should be injected for this resource.
     """
-    if not FILTER_ENABLED or not HOST_KEYWORDS:
+    if not HOST_KEYWORDS:
         return True
-    return any(
-        keyword in candidate
-        for candidate in _provider_identity_strings(provider, holder)
-        for keyword in HOST_KEYWORDS
-    )
+    candidate = _match_candidate(provider, holder)
+    if not candidate:
+        return False
+    return any(keyword in candidate for keyword in HOST_KEYWORDS)
 
 
 def _install_create(
@@ -335,9 +335,10 @@ def _install_create(
             kwargs["extra_headers"] = headers
         elif key:
             logger.debug(
-                "skipped X-Opencode-Session injection: provider identity/url %s "
-                "does not match the configured keywords %s",
-                _provider_identity_strings(provider, holder),
+                "skipped X-Opencode-Session injection: match_mode=%s candidate=%r "
+                "does not contain any of %s",
+                MATCH_MODE,
+                _match_candidate(provider, holder),
                 HOST_KEYWORDS,
             )
         return await original(*args, **kwargs)
@@ -546,7 +547,7 @@ class OpencodeSessionPlugin(Star):
                 the plugin declares no schema.
         """
         super().__init__(context)
-        global TARGET_HEADER, FILTER_ENABLED, HOST_KEYWORDS
+        global TARGET_HEADER, MATCH_MODE, HOST_KEYWORDS
 
         if isinstance(config, dict):
             header = config.get("target_header")
@@ -555,7 +556,8 @@ class OpencodeSessionPlugin(Star):
             else:
                 TARGET_HEADER = HEADER_NAME
 
-            FILTER_ENABLED = bool(config.get("filter_enabled", False))
+            mode = config.get("match_mode")
+            MATCH_MODE = mode if mode in MATCH_MODES else "base_url"
 
             keywords = config.get("host_keywords")
             if isinstance(keywords, (list, tuple)):
@@ -564,9 +566,9 @@ class OpencodeSessionPlugin(Star):
                 )
 
         logger.debug(
-            "opencode session injection target: header=%s filter_enabled=%s keywords=%s",
+            "opencode session injection target: header=%s match_mode=%s keywords=%s",
             TARGET_HEADER,
-            FILTER_ENABLED,
+            MATCH_MODE,
             HOST_KEYWORDS,
         )
 
