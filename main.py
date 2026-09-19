@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 HEADER_NAME = "X-Opencode-Session"
-"""Header name, in canonical casing.
+"""Default header name, in canonical casing.
 
 The casing is load bearing: the OpenAI SDK merges its ``default_headers`` with
 the per-call headers through a case-sensitive ``{**default, **call}`` dict merge
@@ -42,6 +42,15 @@ before httpx normalises anything, so only an exactly-equal key replaces a value
 the user hardcoded into ``custom_headers``. A differently cased key produces two
 separate headers instead of an override.
 """
+
+# --- Configuration -----------------------------------------------------------
+# Populated from the WebUI config in ``_conf_schema.json`` when the plugin is
+# instantiated. Module level because ``wrap_provider`` and the wrappers it
+# installs are module level too, and they must observe config changes without
+# re-installing anything.
+TARGET_HEADER: str = HEADER_NAME
+HOST_KEYWORDS: tuple[str, ...] = ("opencode",)
+MATCH_FULL_URL: bool = False
 
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
@@ -191,6 +200,50 @@ def _iter_creates(client: Any) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
             yield chain, holder, create
 
 
+def _resource_url(holder: Any) -> str:
+    """Return the base URL configured for an OpenAI-style resource.
+
+    Args:
+        holder: Object owning the wrapped ``create`` callable.
+
+    Returns:
+        The lower-cased base URL, or "" when it cannot be determined.
+    """
+    url = getattr(holder, "base_url", None)
+    if url is None:
+        client = getattr(holder, "_client", None)
+        url = getattr(client, "base_url", None)
+    return str(url).lower() if url is not None else ""
+
+
+def _targets_opencode(holder: Any) -> tuple[bool, str]:
+    """Decide whether this resource belongs to the provider we inject into.
+
+    Two deliberate behaviours:
+
+    - When the base URL cannot be read at all (for example a stripped-down or
+      test client), injection proceeds. Narrowing is a best-effort refinement,
+      and silently dropping the header on an unreadable client would break the
+      very use case the plugin exists for.
+    - When a base URL is readable, it must match one of ``HOST_KEYWORDS``. By
+      default the keyword is checked anywhere in the URL so that both the
+      official host and a self-hosted relay with a distinct path work; enable
+      ``match_full_url`` to keep that behaviour explicit, or turn it off to
+      match the host portion only.
+
+    Args:
+        holder: Object owning the wrapped ``create`` callable.
+
+    Returns:
+        A ``(inject, url)`` pair; ``url`` is returned for logging.
+    """
+    url = _resource_url(holder)
+    if not HOST_KEYWORDS or not url:
+        return True, url
+    haystack = url if MATCH_FULL_URL else url.split("//", 1)[-1].split("/", 1)[0]
+    return any(keyword in haystack for keyword in HOST_KEYWORDS), url
+
+
 def _install_create(holder: Any, label: str, current: Any, originals: dict[str, Any]) -> None:
     """Install the header injection wrapper on one ``create`` method.
 
@@ -206,18 +259,27 @@ def _install_create(holder: Any, label: str, current: Any, originals: dict[str, 
     @functools.wraps(original)
     async def create_wrapper(*args: Any, **kwargs: Any) -> Any:
         key = SESSION_KEY.get()
-        if key:
+        inject, url = _targets_opencode(holder)
+        if key and inject:
+            header_name = TARGET_HEADER or HEADER_NAME
             headers = dict(kwargs.get("extra_headers") or {})
             # Canonical key first, so the dedupe below can never delete it.
-            headers[HEADER_NAME] = key
+            headers[header_name] = key
             for name in [
                 name
                 for name in headers
-                if name != HEADER_NAME and str(name).lower() == HEADER_NAME.lower()
+                if name != header_name and str(name).lower() == header_name.lower()
             ]:
                 del headers[name]
-            headers[HEADER_NAME] = key
+            headers[header_name] = key
             kwargs["extra_headers"] = headers
+        elif key and not inject:
+            logger.debug(
+                "skipped X-Opencode-Session injection: base_url %r does not match "
+                "the configured host keywords %s",
+                url,
+                HOST_KEYWORDS,
+            )
         return await original(*args, **kwargs)
 
     setattr(holder, "create", create_wrapper)
@@ -296,7 +358,7 @@ def _provider_label(provider: Any) -> str:
 def _warn_case_variant_headers(provider: Any) -> None:
     """Warn once when configured headers would produce a duplicate header.
 
-    A ``custom_headers`` entry whose name differs from ``HEADER_NAME`` only in
+    A ``custom_headers`` entry whose name differs from the target header only in
     casing cannot be overridden, because the SDK merges headers
     case-sensitively: both the hardcoded value and the per-conversation value
     would be sent, and the upstream service may pick the hardcoded one. The
@@ -314,10 +376,11 @@ def _warn_case_variant_headers(provider: Any) -> None:
     )
     if not isinstance(headers, dict):
         return
+    target = TARGET_HEADER or HEADER_NAME
     variants = [
         str(name)
         for name in headers
-        if str(name) != HEADER_NAME and str(name).lower() == HEADER_NAME.lower()
+        if str(name) != target and str(name).lower() == target.lower()
     ]
     if not variants:
         return
@@ -329,9 +392,9 @@ def _warn_case_variant_headers(provider: Any) -> None:
         "service may pick the hardcoded one, which disables per-session cache "
         "affinity. Remove that custom_headers entry, or rename it to %s.",
         _provider_label(provider),
-        HEADER_NAME,
+        target,
         variants,
-        HEADER_NAME,
+        target,
     )
 
 
@@ -401,7 +464,45 @@ def unwrap_provider(provider: Any) -> None:
 
 
 class OpencodeSessionPlugin(Star):
-    """Bind a per-conversation ``X-Opencode-Session`` header to every LLM call."""
+    """Bind a per-conversation ``X-Opencode-Session`` header to targeted LLM calls."""
+
+    def __init__(self, context: Any, config: Any = None) -> None:
+        """Read the WebUI configuration into the module-level settings.
+
+        AstrBot parses ``_conf_schema.json`` and passes the resulting mapping
+        here on every instantiation, so the settings must be re-applied each
+        time rather than initialised once. Anything unusable keeps its default.
+
+        Args:
+            context: AstrBot plugin context.
+            config: Mapping produced from ``_conf_schema.json``; ``None`` when
+                the plugin declares no schema.
+        """
+        super().__init__(context)
+        global TARGET_HEADER, HOST_KEYWORDS, MATCH_FULL_URL
+
+        if isinstance(config, dict):
+            header = config.get("target_header")
+            if isinstance(header, str) and header.strip():
+                TARGET_HEADER = header.strip()
+            else:
+                TARGET_HEADER = HEADER_NAME
+
+            keywords = config.get("host_keywords")
+            if isinstance(keywords, (list, tuple)):
+                cleaned = tuple(
+                    str(item).strip().lower() for item in keywords if str(item).strip()
+                )
+                HOST_KEYWORDS = cleaned
+
+            MATCH_FULL_URL = bool(config.get("match_full_url", False))
+
+        logger.debug(
+            "opencode session injection target: header=%s keywords=%s match_full_url=%s",
+            TARGET_HEADER,
+            HOST_KEYWORDS,
+            MATCH_FULL_URL,
+        )
 
     @filter.on_llm_request()
     async def on_llm_request(

@@ -104,10 +104,11 @@ AstrBot/
 ├─ data/
 │  └─ plugins/
 │     └─ astrbot-opencode-session/
-│        ├─ __init__.py        # 使目录成为可导入的包
-│        ├─ main.py            # 插件入口（AstrBot 按此文件发现插件）
-│        ├─ metadata.yaml      # 插件元数据（名称、版本、作者等）
-│        └─ requirements.txt   # 依赖声明（本插件不引入第三方依赖）
+│        ├─ __init__.py          # 使目录成为可导入的包
+│        ├─ main.py              # 插件入口（AstrBot 按此文件发现插件）
+│        ├─ metadata.yaml        # 插件元数据（名称、版本、作者等）
+│        ├─ _conf_schema.json    # WebUI 配置表单（注入范围 / 头名）
+│        └─ requirements.txt     # 依赖声明（本插件不引入第三方依赖）
 ```
 
 把整个 `astrbot-opencode-session` 目录复制过去：
@@ -133,7 +134,12 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 
 ## 4. 配置
 
-本插件按约定自动工作，**插件侧不需要填写 session ID**。你只需要在 provider 侧补齐上游要求的其余请求头，主要是 `user-agent`。
+配置分两处：
+
+- **插件侧**（WebUI → `插件` → 本插件 → `配置`）：控制**往哪些 provider** 注入、注入**哪个头名**。见 4.3。
+- **provider 侧**：补齐上游要求的其余请求头，主要是 `user-agent`。见 4.1 / 4.2。
+
+本插件按约定自动工作，**插件侧不需要填写 session ID**。
 
 ### 4.1 为什么必须设置 `user-agent`
 
@@ -163,6 +169,31 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 - 值的类型必须是字符串；`build_provider_headers()` 会对键和值做 `str()` 转换（`astrbot/core/provider/headers.py:17-18`）。
 - 就 `User-Agent` 这一项而言，键名大小写不敏感：`user-agent`、`User-Agent`、`USER-AGENT` 都会被识别成同一个头并用于覆盖 AstrBot 默认 UA（`astrbot/core/provider/headers.py:19-21`）；值为空白字符串时会被忽略、回退到默认 UA。**但这只是 AstrBot 对该键的特殊处理**，并不代表所有自定义头都大小写宽容——OpenAI SDK 合并请求头用的是精确键匹配（见第 2.1 节），因此新增自定义头时请一律使用规范大小写。
 - 不要使用会触发浏览器/CORS 语义或上游不认可的怪异头名；未知头名会被上游忽略。
+
+### 4.3 插件配置（WebUI 可改）
+
+本插件提供 WebUI 配置表单（`_conf_schema.json`）。打开 **WebUI → `插件` → `astrbot-opencode-session` → 配置**（齿轮图标）即可修改，保存后立即生效、无需重启。
+
+| 配置项 | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `host_keywords` | 字符串列表 | `["opencode"]` | **只有 base_url 匹配这些关键字的 provider 才会被注入**，其它提供商（OpenAI、DeepSeek、本地 Ollama 等）一律不加。留空 ⇒ 对所有 provider 都注入。 |
+| `match_full_url` | 布尔 | `false` | 关闭时只用 URL 的**域名部分**匹配关键字；开启时用**完整 URL**匹配（适用于域名不含 `opencode`、但路径里含的中转）。 |
+| `target_header` | 字符串 | `X-Opencode-Session` | 注入的请求头名称。除非对接别的兼容网关，否则不要改。 |
+
+**为什么默认收窄**：`X-Opencode-Session` 的值是 AstrBot 的对话链 ID。默认只发给域名匹配 `opencode` 的 provider，避免把会话 ID 附带发给你配置的其它服务（例如 DeepSeek、OpenAI 或第三方中转）。
+
+**按你的实际接入点设置**（自定义 OpenAI 兼容 provider）：
+
+| 你的 `api_base` 形态 | 该怎么配 |
+| --- | --- |
+| `https://api.opencode.ai/v1`（官方直连） | 默认即可，无需改动 |
+| `api.opencode.ai/v1`（**省略了 `https://`**） | 默认即可 —— 实测域名提取仍能拿到 `api.opencode.ai` |
+| `https://relay.mydomain.net/opencode/v1`（中转，路径含 opencode） | 把 `match_full_url` 打开 |
+| `https://relay.mydomain.net/v1`（中转，域名路径都不含 opencode） | 在 `host_keywords` 里加入 `relay.mydomain.net` |
+
+**取不到 base_url 时的行为**：如果某个 provider 的 base_url 读不出来，插件会**照旧注入**（而不是跳过）。这是刻意的：收窄只是「尽力而为」的优化，不能因为读不到地址就让主用途静默失效。
+
+配置写入 `data/config/astrbot_plugin_opencode_session_config.json`。
 
 ---
 
@@ -222,6 +253,7 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 - **不代替 API Key 与 UA 配置**：插件只负责会话标识，上游要求的其余头（尤其是 `user-agent`）仍需你自行在 provider 配置中补齐。
 - **会话标识取不到时省略该头**：当三个会话键来源全部为空、取不到可用会话标识时，插件会**省略**该头（不注入），并且**不会**退化成某个固定常量值。这是刻意设计：宁可少发一个头，也不让所有异常请求共用一个 ID——后者既没有缓存收益，又会制造上游风控特征。
 - **大小写不宽容**：`custom_headers` 中该头必须使用规范大小写 `X-Opencode-Session`；写成其它形式会出站重复头、覆盖结果未定义（见第 2.1 节）。
+- **注入范围按域名收窄**：默认只向 base_url 匹配 `opencode` 的 provider 注入（见第 4.3 节）。若你的接入点域名不含该关键字，需要自行在插件配置里加白名单，否则会表现为「该头整个缺失」。反过来，把 `host_keywords` 留空会让**所有** provider 都收到该头——此时会话 ID 也会发往无关服务。
 
 ---
 
@@ -236,7 +268,8 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 | 收到了请求，但找不到 `x-opencode-session` | 该 provider 类型不在覆盖范围内（见第 7 节）；或请求没走 LLM provider 链路。 |
 | 头存在，但值总是同一个 | 检查是否在 `custom_headers` 里写死了 `X-Opencode-Session`（见第 2 节）。在**规范大小写**下插件会在出站时无条件覆盖该头，所以正常情况下你看到的不会是写死的那串；如果看到的恰好就是写死值，说明插件没有加载成功、注入链路没生效，或该头被写成了非规范大小写（见下一行），请先按规范大小写配置或直接删掉该配置项后重来。 |
 | 插件装了但缓存亲和性没效果 / 抓包看到重复的 session 头 | `custom_headers` 中该头使用了**非规范大小写**（如 `x-opencode-session`、`X-OPENCODE-SESSION`），导致 SDK 精确键合并不上、出站出现两个头（实测值形如 `['HARDCODED', 'cid-lower']`）。此时**插件无法保证覆盖成功、结果未定义**：插件的值在写死值之后，但上游取首值还是末值取决于实现（httpx 标量取末值，许多反向代理 / 服务端**取首值**）。处理：改为规范大小写 `X-Opencode-Session`，或从 `custom_headers` 中删除该配置项。插件会就此打一条英文 warning（每个 provider 实例最多一次），但不会替你改配置。 |
-| 抓包发现该头整个缺失（不是重复） | 说明本次请求三个会话键来源全为空，插件按设计**省略**该头而非填一个固定常量（见第 7 节）。若频繁出现，请确认请求确实关联到了一条对话链。 |
+| 抓包发现该头整个缺失（不是重复） | 两种情况，按可能性排序：①**该 provider 的 base_url 不匹配插件配置的 `host_keywords`**——默认只注入域名含 `opencode` 的 provider，自建中转最常见的踩坑点（见第 4.3 节，改配置即可）；②本次请求三个会话键来源全为空，插件按设计**省略**该头而非填固定常量（见第 7 节），若频繁出现请确认请求确实关联到了一条对话链。排查时先看插件日志：域名不匹配会留下 debug 级记录。 |
+| 只想给 OpenCode 加，但别的 provider 也被加了 | 说明 `host_keywords` 被清空了（留空 = 对所有 provider 注入，会话 ID 会发往无关服务）。填回关键字即可（见第 4.3 节）。 |
 | 头存在，但值每次都在变 | 确认它是否等于当前对话链的 `cid`；若你用的是「每次请求都新建会话」的调用方式，会话粒度本身就是新的。 |
 | 上游返回 401 / 403 / 被拦截 | 多半与 session 无关：优先检查 API Key、`api_base`，以及 `user-agent` 是否设置成了常见 agent 工具的值（见第 4.1 节）。 |
 | 上游报会话标识相关错误 | 确认头值非空；本插件产出的 UUID 形态取值符合上游目前的校验，若报错请记录完整请求头与上游响应以便定位。 |
@@ -250,24 +283,28 @@ astrbot-opencode-session/
 ├── main.py              # 插件本体（全部逻辑，仅标准库）
 ├── __init__.py          # 包入口，重导出 OpencodeSessionPlugin
 ├── metadata.yaml        # AstrBot 插件元数据（name 用下划线形式）
+├── _conf_schema.json    # WebUI 配置表单（注入范围 / 头名，见第 4.3 节）
 ├── requirements.txt     # 依赖声明：无第三方依赖
+├── LICENSE              # MIT
 ├── tests/
-│   ├── test_injection.py   # 回归测试：注入 / 并发隔离 / 幂等 / 覆盖与告警
-│   └── test_fallback.py    # 回归测试：会话键回退链与防退化
+│   ├── test_injection.py    # 回归测试：注入 / 并发隔离 / 幂等 / 覆盖与告警
+│   ├── test_fallback.py     # 回归测试：会话键回退链与防退化
+│   └── test_host_filter.py  # 回归测试：注入范围收窄与 WebUI 配置
 ├── REQUIREMENTS.md      # 冻结的接口契约（每条结论带 AstrBot file:line）
 ├── VERIFICATION.md      # 独立验证记录（含负向对照）
 └── README.md
 ```
 
-**安装时只需要 `main.py` / `__init__.py` / `metadata.yaml` / `requirements.txt` 四项**；`tests/` 与三份 Markdown 是开发与审计资料，AstrBot 不会加载它们，留着不影响运行。
+**安装时 `main.py` / `__init__.py` / `metadata.yaml` / `_conf_schema.json` / `requirements.txt` 都必须带上**（少了 `_conf_schema.json` 就没有 WebUI 配置界面）；`tests/`、`LICENSE` 与三份 Markdown 是开发与审计资料，AstrBot 不会加载它们，留着不影响运行。
 
 ## 10. 测试与可复核性
 
-两套回归测试都是自包含的：自带 fake `astrbot` 模块，用 `importlib` 按文件路径加载 `main.py`，因此**不需要安装 AstrBot、也不需要 pytest**，纯标准库运行。
+三套回归测试都是自包含的：自带 fake `astrbot` 模块，用 `importlib` 按文件路径加载 `main.py`，因此**不需要安装 AstrBot、也不需要 pytest**，纯标准库运行。
 
 ```bash
 uv run --no-project python astrbot-opencode-session/tests/test_injection.py
 uv run --no-project python astrbot-opencode-session/tests/test_fallback.py
+uv run --no-project python astrbot-opencode-session/tests/test_host_filter.py
 ```
 
 在本仓库交付时点的实测结果（Python 3.14.6）：
@@ -276,16 +313,9 @@ uv run --no-project python astrbot-opencode-session/tests/test_fallback.py
 | --- | --- | --- | --- |
 | `test_injection.py` | 30 | 30 PASS / exit 0 | 会话键取值与注入、并发不串台、包装幂等、规范大小写覆盖、非规范大小写只告警不改配置、`client._custom_headers` 前后全等 |
 | `test_fallback.py` | 21 | 21 PASS / exit 0 | 三级回退链、三来源全空时省略头且不退化为常量、无落盘状态、钩子外兜底路径 |
+| `test_host_filter.py` | 31 | 31 PASS / exit 0 | 默认收窄只注入匹配域名的 provider、自定义关键字、留空则全注入、域名/全 URL 两种匹配、自定义头名、base_url 读不到时仍注入、省略 scheme 的 base_url、`_conf_schema.json` 结构 |
 
-交付时点的文件校验值（SHA256 前 16 位）：
-
-| 文件 | SHA256 前缀 |
-| --- | --- |
-| `main.py` | `7793EF5DBE105F9B` |
-| `tests/test_injection.py` | `9CAC4ACD89ED3DA8` |
-| `tests/test_fallback.py` | `9EE41BECBE5E5F5B` |
-
-关于测试可信度：这两套测试都做过**负向对照**——把 `main.py` 复制一份、故意注入缺陷后重跑，确认测试会失败且失败项精确对应缺陷（而不是"永远全绿"）。复现步骤与实测数字写在 `test_fallback.py` 的模块 docstring 里。注意 `test_injection.py` 与 `test_fallback.py` 的检测范围并不重合（前者能抓覆盖缺陷、后者不能），所以**两套都要跑**。
+关于测试可信度：`test_injection.py` / `test_fallback.py` 做过**负向对照**——把 `main.py` 复制一份、故意注入缺陷后重跑，确认测试会失败且失败项精确对应缺陷（而不是"永远全绿"）。复现步骤与实测数字写在 `test_fallback.py` 的模块 docstring 里。注意两套测试的检测范围并不重合（前者能抓覆盖缺陷、后者不能），所以**都要跑**；`test_host_filter.py` 覆盖的是注入范围与配置，与上述两者同样不重合。
 
 ## 11. 相关源码位置速查
 
