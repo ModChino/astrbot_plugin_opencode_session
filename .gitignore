@@ -13,3 +13,12 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 仅本地保留的开发与审计材料
+#
+# AstrBot 插件仓库的惯例是只放插件本体与用户文档（抽样多个插件仓库、含官方
+# 模板 Soulert/helloworld，均无 tests/ 目录）。这三项保留在工作区中供本地回归
+# 与追溯，但不随仓库分发，也未出现在 git 历史中。
+tests/
+REQUIREMENTS.md
+VERIFICATION.md

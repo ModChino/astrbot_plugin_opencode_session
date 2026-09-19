@@ -13,6 +13,6 @@ desc: |-
   ⚠️ 请勿把 `X-Opencode-Session` 写死成固定值：写死会让所有会话共用一个 ID，缓存亲和性完全失效，并可能触发上游的异常风控特征。另外建议将 `user-agent` 配置为常见 agent 工具的值。
 
   详见仓库 README 的安装、配置与验证章节。
-version: "1.0.0"
+version: "1.0.1"
 author: ModChino
 repo: https://github.com/ModChino/astrbot_plugin_opencode_session

@@ -72,9 +72,14 @@ WRAP_FLAG = "__oc_session_wrapped__"
 ORIGINALS_ATTR = "__oc_session_originals__"
 WARNED_ATTR = "__oc_session_case_warned__"
 
-_CREATE_CHAINS: tuple[tuple[str, ...], ...] = (
-    ("chat", "completions"),
-    ("responses",),
+_CREATE_CHAINS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("chat", "completions"), "create"),
+    (("responses",), "create"),
+    # ``GET /models`` is a separate resource, but AstrBot's provider "test"
+    # button reaches it through ``provider.get_models()``
+    # (openai_source.py:437-447 -> client.models.list). Upstream rejects that
+    # request too when the session header is absent, so it must be wrapped.
+    (("models",), "list"),
 )
 _TEXT_METHODS = ("text_chat", "text_chat_stream")
 _MAX_KEY_LENGTH = 128
@@ -175,19 +180,23 @@ def _apply_session_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> N
     SESSION_KEY.set(_derive(session_id))
 
 
-def _iter_creates(client: Any) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
-    """Yield every available ``create`` callable of an OpenAI-style client.
+def _iter_creates(client: Any) -> Iterator[tuple[tuple[tuple[str, ...], str], Any, Any]]:
+    """Yield every request entry point of an OpenAI-style client.
+
+    Not just ``create``: ``models.list`` is a second outbound path that AstrBot
+    reaches when fetching the model list, and it needs the same header.
 
     Args:
         client: Candidate SDK client; ``None`` yields nothing.
 
     Yields:
-        ``(attribute_chain, holder, create)`` triples. The chain is resolved
-        dynamically, so a client without ``responses`` degrades silently.
+        ``((attribute_chain, method), holder, callable)`` triples. Chains are
+        resolved dynamically, so a client without ``responses`` or ``models``
+        degrades silently.
     """
     if client is None:
         return
-    for chain in _CREATE_CHAINS:
+    for chain, method in _CREATE_CHAINS:
         holder = client
         for attribute in chain:
             holder = getattr(holder, attribute, None)
@@ -195,9 +204,9 @@ def _iter_creates(client: Any) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
                 break
         if holder is None:
             continue
-        create = getattr(holder, "create", None)
-        if callable(create):
-            yield chain, holder, create
+        func = getattr(holder, method, None)
+        if callable(func):
+            yield (chain, method), holder, func
 
 
 def _resource_url(holder: Any) -> str:
@@ -244,13 +253,21 @@ def _targets_opencode(holder: Any) -> tuple[bool, str]:
     return any(keyword in haystack for keyword in HOST_KEYWORDS), url
 
 
-def _install_create(holder: Any, label: str, current: Any, originals: dict[str, Any]) -> None:
-    """Install the header injection wrapper on one ``create`` method.
+def _install_create(
+    holder: Any,
+    label: str,
+    method: str,
+    current: Any,
+    originals: dict[str, Any],
+) -> None:
+    """Install the header injection wrapper on one client entry point.
 
     Args:
-        holder: Object owning ``create`` (the completions or responses resource).
+        holder: Object owning the callable (a completions/responses/models
+            resource).
         label: Stable key used to remember the original callable.
-        current: The currently bound ``create`` callable.
+        method: Attribute name to replace, e.g. ``create`` or ``list``.
+        current: The currently bound callable.
         originals: Per-provider map of label to the original callable.
     """
     original = originals.get(label) or current
@@ -282,7 +299,7 @@ def _install_create(holder: Any, label: str, current: Any, originals: dict[str, 
             )
         return await original(*args, **kwargs)
 
-    setattr(holder, "create", create_wrapper)
+    setattr(holder, method, create_wrapper)
 
 
 def _install_text_method(
@@ -423,8 +440,14 @@ def wrap_provider(provider: Any) -> bool:
 
     wrapped = False
     client = getattr(provider, "client", None)
-    for chain, holder, create in _iter_creates(client):
-        _install_create(holder, ".".join((*chain, "create")), create, originals)
+    for (chain, method), holder, current in _iter_creates(client):
+        _install_create(
+            holder,
+            ".".join((*chain, method)),
+            method,
+            current,
+            originals,
+        )
         wrapped = True
     for name in _TEXT_METHODS:
         method = getattr(provider, name, None)
