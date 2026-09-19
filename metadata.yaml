@@ -1,0 +1,5 @@
+name: astrbot_plugin_opencode_session
+display_name: OpenCode 会话缓存头注入
+desc: 按对话链为每次 LLM 请求动态注入 X-Opencode-Session 请求头，使 OpenCode Go 能按会话命中 GPU 上下文缓存。
+version: "1.0.0"
+author: placeholder

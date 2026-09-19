@@ -1,0 +1,7 @@
+# Normalize to LF in the repository so Windows clones don't produce spurious diffs.
+* text=auto eol=lf
+
+# Keep these binary-ish files untouched.
+*.png binary
+*.jpg binary
+*.webp binary

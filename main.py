@@ -1,0 +1,444 @@
+"""Inject a per-conversation ``X-Opencode-Session`` header into AstrBot LLM calls.
+
+OpenCode Go keys its GPU context cache by a client supplied session identifier.
+AstrBot builds provider request headers exactly once, at provider construction
+time: ``astrbot/core/provider/headers.py:6-24`` only stringifies the configured
+mapping and performs no placeholder substitution. A static ``custom_headers``
+entry therefore cannot express "one value per conversation".
+
+This plugin derives the value from the conversation chain and merges it into each
+individual request through the SDK's per-call ``extra_headers`` argument. Shared
+provider/client state -- the configured headers of the provider and the client's
+private default header mapping -- is only ever read, never written, so concurrent
+conversations cannot leak into each other's requests.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import functools
+import inspect
+import logging
+import uuid
+from typing import TYPE_CHECKING, Any
+
+from astrbot.api.event import filter
+from astrbot.api.star import Star
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from astrbot.api.event import AstrMessageEvent
+    from astrbot.api.provider import ProviderRequest
+
+logger = logging.getLogger(__name__)
+
+HEADER_NAME = "X-Opencode-Session"
+"""Header name, in canonical casing.
+
+The casing is load bearing: the OpenAI SDK merges its ``default_headers`` with
+the per-call headers through a case-sensitive ``{**default, **call}`` dict merge
+before httpx normalises anything, so only an exactly-equal key replaces a value
+the user hardcoded into ``custom_headers``. A differently cased key produces two
+separate headers instead of an override.
+"""
+
+SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "opencode_session_key",
+    default="",
+)
+"""The value injected as ``X-Opencode-Session``; "" means "do not inject"."""
+
+SESSION_SID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "opencode_session_sid",
+    default="",
+)
+"""The session id that ``SESSION_KEY`` currently describes.
+
+Acts as a guard so the ``text_chat`` fallback never downgrades a key the hook
+already resolved from ``conversation.cid`` into ``uuid5(session_id)``.
+"""
+
+WRAP_FLAG = "__oc_session_wrapped__"
+ORIGINALS_ATTR = "__oc_session_originals__"
+WARNED_ATTR = "__oc_session_case_warned__"
+
+_CREATE_CHAINS: tuple[tuple[str, ...], ...] = (
+    ("chat", "completions"),
+    ("responses",),
+)
+_TEXT_METHODS = ("text_chat", "text_chat_stream")
+_MAX_KEY_LENGTH = 128
+
+
+def _clean(value: Any) -> str:
+    """Return ``value`` as a stripped, header-safe string.
+
+    Args:
+        value: Any candidate token; ``None`` is treated as absent.
+
+    Returns:
+        The cleaned token, or "" when it is empty, too long, or contains control
+        characters that are illegal inside an HTTP header value.
+    """
+    text = str(value).strip() if value is not None else ""
+    if not text or any(ord(char) < 0x20 for char in text):
+        return ""
+    return text[:_MAX_KEY_LENGTH]
+
+
+def _derive(session_id: str) -> str:
+    """Derive a stable session key from an opaque session id.
+
+    Args:
+        session_id: Non-empty session identifier.
+
+    Returns:
+        The deterministic UUIDv5 string for ``session_id``. There is no clock,
+        no randomness and no I/O involved, so a persisted mapping table is never
+        needed: the same session id always yields the same key.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, session_id))
+
+
+def _resolve_session(event: Any, req: Any) -> tuple[str, str]:
+    """Resolve the conversation key using the frozen three-source order.
+
+    Args:
+        event: The message event carrying ``unified_msg_origin``.
+        req: The provider request carrying ``conversation`` and ``session_id``.
+
+    Returns:
+        A ``(key, session_id)`` pair. ``key`` is "" when no source yields a
+        value; in that case the header must be omitted entirely rather than
+        degraded into a constant shared by every broken request.
+    """
+    conversation = getattr(req, "conversation", None)
+    cid = _clean(getattr(conversation, "cid", None)) if conversation is not None else ""
+    session_id = _clean(getattr(req, "session_id", None)) or _clean(
+        getattr(event, "unified_msg_origin", None)
+    )
+    if cid:
+        return cid, session_id
+    if session_id:
+        return _derive(session_id), session_id
+    return "", ""
+
+
+def _session_id_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    """Read the explicit ``session_id`` of a provider call.
+
+    ``session_id`` is the second positional parameter of ``Provider.text_chat``
+    (``astrbot/core/provider/provider.py:100-103``), but every in-tree caller
+    passes it as a keyword argument, so both forms are honoured.
+
+    Args:
+        args: Positional arguments of the provider call.
+        kwargs: Keyword arguments of the provider call.
+
+    Returns:
+        The cleaned session id, or "" when the call does not carry one.
+    """
+    session_id = kwargs.get("session_id")
+    if session_id is None and len(args) > 1:
+        session_id = args[1]
+    return _clean(session_id)
+
+
+def _apply_session_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Bind the conversation key from an explicit ``session_id`` argument.
+
+    This is the fallback for provider calls that never reach ``on_llm_request``
+    (for example the tool-loop re-queries). It only ever *sets*: a reset would
+    hand a stale key to the streaming HTTP call, which happens in a later
+    pipeline stage but still inside this same task.
+
+    Args:
+        args: Positional arguments of the provider call.
+        kwargs: Keyword arguments of the provider call.
+    """
+    session_id = _session_id_from_call(args, kwargs)
+    if not session_id or session_id == SESSION_SID.get():
+        # Nothing to bind, or the hook already resolved this very conversation,
+        # possibly from a cid, which must win over a derived value.
+        return
+    SESSION_SID.set(session_id)
+    SESSION_KEY.set(_derive(session_id))
+
+
+def _iter_creates(client: Any) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
+    """Yield every available ``create`` callable of an OpenAI-style client.
+
+    Args:
+        client: Candidate SDK client; ``None`` yields nothing.
+
+    Yields:
+        ``(attribute_chain, holder, create)`` triples. The chain is resolved
+        dynamically, so a client without ``responses`` degrades silently.
+    """
+    if client is None:
+        return
+    for chain in _CREATE_CHAINS:
+        holder = client
+        for attribute in chain:
+            holder = getattr(holder, attribute, None)
+            if holder is None:
+                break
+        if holder is None:
+            continue
+        create = getattr(holder, "create", None)
+        if callable(create):
+            yield chain, holder, create
+
+
+def _install_create(holder: Any, label: str, current: Any, originals: dict[str, Any]) -> None:
+    """Install the header injection wrapper on one ``create`` method.
+
+    Args:
+        holder: Object owning ``create`` (the completions or responses resource).
+        label: Stable key used to remember the original callable.
+        current: The currently bound ``create`` callable.
+        originals: Per-provider map of label to the original callable.
+    """
+    original = originals.get(label) or current
+    originals[label] = original
+
+    @functools.wraps(original)
+    async def create_wrapper(*args: Any, **kwargs: Any) -> Any:
+        key = SESSION_KEY.get()
+        if key:
+            headers = dict(kwargs.get("extra_headers") or {})
+            # Canonical key first, so the dedupe below can never delete it.
+            headers[HEADER_NAME] = key
+            for name in [
+                name
+                for name in headers
+                if name != HEADER_NAME and str(name).lower() == HEADER_NAME.lower()
+            ]:
+                del headers[name]
+            headers[HEADER_NAME] = key
+            kwargs["extra_headers"] = headers
+        return await original(*args, **kwargs)
+
+    setattr(holder, "create", create_wrapper)
+
+
+def _install_text_method(
+    provider: Any,
+    name: str,
+    current: Any,
+    originals: dict[str, Any],
+) -> None:
+    """Install the context binding wrapper on one provider text method.
+
+    Args:
+        provider: Provider instance owning the method.
+        name: Method name, either ``text_chat`` or ``text_chat_stream``.
+        current: The currently bound method.
+        originals: Per-provider map of name to the original method.
+    """
+    original = originals.get(name) or current
+    originals[name] = original
+
+    if inspect.isasyncgenfunction(original):
+        # ``text_chat_stream`` is an async generator function. A plain function
+        # wrapper is sufficient and preferable: an async generator body runs in
+        # the caller's context on every resumption, so binding the key before the
+        # generator is created is enough, and no forwarding layer is needed.
+        @functools.wraps(original)
+        def stream_wrapper(*args: Any, **kwargs: Any) -> Any:
+            # The hook may never have run on this path, so make sure the
+            # ``create`` wrapper that consumes the key is in place first.
+            wrap_provider(provider)
+            # Intentionally no reset; see the streaming note in the hook.
+            _apply_session_from_call(args, kwargs)
+            return original(*args, **kwargs)
+
+        setattr(provider, name, stream_wrapper)
+        return
+
+    # ``text_chat`` is a coroutine function and stays one. ``functools.wraps``
+    # only sets ``__wrapped__``, which ``inspect.iscoroutinefunction`` does not
+    # follow, so a synchronic wrapper would silently flip that attribute and any
+    # code branching on it would take the wrong path.
+    @functools.wraps(original)
+    async def chat_wrapper(*args: Any, **kwargs: Any) -> Any:
+        # The hook may never have run on this path, so make sure the ``create``
+        # wrapper that consumes the key is in place first.
+        wrap_provider(provider)
+        # Intentionally no reset; see the streaming note in the hook.
+        _apply_session_from_call(args, kwargs)
+        return await original(*args, **kwargs)
+
+    setattr(provider, name, chat_wrapper)
+
+
+def _provider_label(provider: Any) -> str:
+    """Return a short label identifying one provider in log output.
+
+    Args:
+        provider: Provider instance to describe.
+
+    Returns:
+        The configured provider id when it can be read safely, otherwise the
+        provider's class name. Never raises: an unreadable id must not suppress
+        the warning it is attached to.
+    """
+    try:
+        label = getattr(provider.meta(), "id", None)
+        if label:
+            return str(label)
+    except Exception:
+        pass
+    return type(provider).__name__ or "unknown"
+
+
+def _warn_case_variant_headers(provider: Any) -> None:
+    """Warn once when configured headers would produce a duplicate header.
+
+    A ``custom_headers`` entry whose name differs from ``HEADER_NAME`` only in
+    casing cannot be overridden, because the SDK merges headers
+    case-sensitively: both the hardcoded value and the per-conversation value
+    would be sent, and the upstream service may pick the hardcoded one. The
+    user's configuration is reported, never modified.
+
+    Args:
+        provider: Provider instance whose configured headers are inspected.
+    """
+    if getattr(provider, WARNED_ATTR, False):
+        return
+    headers = getattr(provider, "custom_headers", None) or getattr(
+        provider,
+        "request_headers",
+        None,
+    )
+    if not isinstance(headers, dict):
+        return
+    variants = [
+        str(name)
+        for name in headers
+        if str(name) != HEADER_NAME and str(name).lower() == HEADER_NAME.lower()
+    ]
+    if not variants:
+        return
+    setattr(provider, WARNED_ATTR, True)
+    logger.warning(
+        "Provider %s defines %s with the non-canonical casing %s. "
+        "The OpenAI SDK merges headers case-sensitively, so both that hardcoded "
+        "value and the per-conversation value would be sent and the upstream "
+        "service may pick the hardcoded one, which disables per-session cache "
+        "affinity. Remove that custom_headers entry, or rename it to %s.",
+        _provider_label(provider),
+        HEADER_NAME,
+        variants,
+        HEADER_NAME,
+    )
+
+
+def wrap_provider(provider: Any) -> bool:
+    """Idempotently install the header injection wrappers on one provider.
+
+    Every call rebuilds the wrappers from the originals recorded on the first
+    call, so repeated calls never stack layers. Rebuilding on every call is also
+    what makes a plugin hot reload self-healing: a reload creates a brand new
+    module-level ContextVar while the provider and its client survive, so a
+    wrapper still bound to the previous module would keep reading a variable that
+    nothing writes any more.
+
+    Args:
+        provider: Candidate provider instance; anything unusable is skipped.
+
+    Returns:
+        True when at least one wrapper is installed on the provider.
+    """
+    if provider is None:
+        return False
+    originals = getattr(provider, ORIGINALS_ATTR, None)
+    if not isinstance(originals, dict):
+        originals = {}
+        setattr(provider, ORIGINALS_ATTR, originals)
+
+    wrapped = False
+    client = getattr(provider, "client", None)
+    for chain, holder, create in _iter_creates(client):
+        _install_create(holder, ".".join((*chain, "create")), create, originals)
+        wrapped = True
+    for name in _TEXT_METHODS:
+        method = getattr(provider, name, None)
+        if callable(method):
+            _install_text_method(provider, name, method, originals)
+            wrapped = True
+    if wrapped:
+        setattr(provider, WRAP_FLAG, True)
+    _warn_case_variant_headers(provider)
+    return wrapped
+
+
+def unwrap_provider(provider: Any) -> None:
+    """Restore the provider methods this plugin replaced.
+
+    Args:
+        provider: Provider instance previously passed to ``wrap_provider``.
+    """
+    originals = getattr(provider, ORIGINALS_ATTR, None)
+    if not isinstance(originals, dict) or not originals:
+        return
+    client = getattr(provider, "client", None)
+    for label, original in originals.items():
+        holder_name, _, attribute = label.rpartition(".")
+        target: Any = provider
+        if holder_name:
+            target = client
+            for part in holder_name.split("."):
+                target = getattr(target, part, None)
+                if target is None:
+                    break
+        if target is not None:
+            setattr(target, attribute, original)
+    originals.clear()
+    provider.__dict__.pop(ORIGINALS_ATTR, None)
+    provider.__dict__.pop(WRAP_FLAG, None)
+
+
+class OpencodeSessionPlugin(Star):
+    """Bind a per-conversation ``X-Opencode-Session`` header to every LLM call."""
+
+    @filter.on_llm_request()
+    async def on_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """Record the conversation key and keep every provider wrapped.
+
+        Args:
+            event: The message event being processed.
+            req: The provider request about to be sent to the model.
+        """
+        try:
+            key, session_id = _resolve_session(event, req)
+            # Intentionally no reset: the streaming HTTP call happens in a later
+            # pipeline stage but inside this same task, so resetting here would
+            # expose the previous conversation's key to it.
+            SESSION_KEY.set(key)
+            SESSION_SID.set(session_id)
+            for provider in self.context.get_all_providers():
+                wrap_provider(provider)
+        except Exception:
+            logger.debug("opencode session injection skipped", exc_info=True)
+
+    async def initialize(self) -> None:
+        """Wrap the providers that already exist when the plugin is activated."""
+        try:
+            for provider in self.context.get_all_providers():
+                wrap_provider(provider)
+        except Exception:
+            logger.debug("opencode session prewrap skipped", exc_info=True)
+
+    async def terminate(self) -> None:
+        """Restore the provider methods this plugin replaced."""
+        try:
+            for provider in self.context.get_all_providers():
+                unwrap_provider(provider)
+        except Exception:
+            logger.debug("opencode session unwrap skipped", exc_info=True)
