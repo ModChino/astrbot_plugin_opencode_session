@@ -49,8 +49,8 @@ separate headers instead of an override.
 # installs are module level too, and they must observe config changes without
 # re-installing anything.
 TARGET_HEADER: str = HEADER_NAME
+FILTER_ENABLED: bool = False
 HOST_KEYWORDS: tuple[str, ...] = ("opencode",)
-MATCH_FULL_URL: bool = False
 
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
@@ -212,8 +212,10 @@ def _iter_creates(client: Any) -> Iterator[tuple[tuple[tuple[str, ...], str], An
 def _resource_url(holder: Any) -> str:
     """Return the base URL configured for an OpenAI-style resource.
 
+    Used only for diagnostics: injection is never gated on the URL.
+
     Args:
-        holder: Object owning the wrapped ``create`` callable.
+        holder: Object owning the wrapped callable.
 
     Returns:
         The lower-cased base URL, or "" when it cannot be determined.
@@ -225,51 +227,62 @@ def _resource_url(holder: Any) -> str:
     return str(url).lower() if url is not None else ""
 
 
-def _targets_opencode(holder: Any) -> tuple[bool, str]:
-    """Decide whether this resource belongs to the provider we inject into.
+def _provider_identity_strings(provider: Any, holder: Any) -> tuple[str, ...]:
+    """Collect the strings a keyword may match against for one provider.
 
-    Two deliberate behaviours:
-
-    - When the base URL cannot be read at all (for example a stripped-down or
-      test client), injection proceeds. Narrowing is a best-effort refinement,
-      and silently dropping the header on an unreadable client would break the
-      very use case the plugin exists for.
-    - When a base URL is readable, it must match one of ``HOST_KEYWORDS``. By
-      default the keyword is checked anywhere in the URL so that both the
-      official host and a self-hosted relay with a distinct path work; enable
-      ``match_full_url`` to keep that behaviour explicit, or turn it off to
-      match the host portion only.
+    Both the provider's own identity and its URL are searched, because a request
+    frequently goes through a self-hosted relay: the provider may be named
+    ``opencode/...`` while its ``api_base`` is a LAN address with no
+    relationship to the upstream domain. Matching on the URL alone silently
+    misses that case.
 
     Args:
-        holder: Object owning the wrapped ``create`` callable.
+        provider: Provider instance owning the client.
+        holder: Object owning the wrapped callable.
 
     Returns:
-        A ``(inject, url)`` pair; ``url`` is returned for logging.
+        Lower-cased candidate strings, most specific first.
     """
-    url = _resource_url(holder)
-    if not HOST_KEYWORDS or not url:
-        return True, url
-    haystack = url if MATCH_FULL_URL else url.split("//", 1)[-1].split("/", 1)[0]
-    return any(keyword in haystack for keyword in HOST_KEYWORDS), url
-
-
-def _provider_stable_key(provider: Any) -> str:
-    """Derive a stable per-provider value.
-
-    Args:
-        provider: Provider instance owning the wrapped callable.
-
-    Returns:
-        A deterministic UUIDv5 string, or "" when it cannot be derived.
-    """
+    candidates: list[str] = []
     try:
-        label = getattr(provider.meta(), "id", None)
+        meta_id = getattr(provider.meta(), "id", None)
+        if meta_id:
+            candidates.append(str(meta_id))
     except Exception:
-        label = None
-    if not label:
-        label = type(provider).__name__
-    cleaned = _clean(label)
-    return _derive(cleaned) if cleaned else ""
+        pass
+    try:
+        provider_type = getattr(provider.meta(), "provider_type", None)
+        if provider_type:
+            candidates.append(str(provider_type))
+    except Exception:
+        pass
+    candidates.append(type(provider).__name__)
+    candidates.append(_resource_url(holder))
+    return tuple(item.lower() for item in candidates if item)
+
+
+def _should_inject(provider: Any, holder: Any) -> bool:
+    """Decide whether the header belongs on this provider's requests.
+
+    Filtering is opt-in: with ``filter_enabled`` off, every OpenAI-compatible
+    provider is injected. This default is deliberate. Gating on a URL keyword
+    silently disables the plugin's only job when a request is routed through a
+    relay, which is exactly the failure mode that made the plugin appear broken.
+
+    Args:
+        provider: Provider instance owning the client.
+        holder: Object owning the wrapped callable.
+
+    Returns:
+        True when the header should be injected for this resource.
+    """
+    if not FILTER_ENABLED or not HOST_KEYWORDS:
+        return True
+    return any(
+        keyword in candidate
+        for candidate in _provider_identity_strings(provider, holder)
+        for keyword in HOST_KEYWORDS
+    )
 
 
 def _install_create(
@@ -307,8 +320,7 @@ def _install_create(
         key = SESSION_KEY.get()
         if not key and is_contextless:
             key = str(uuid.uuid4())
-        inject, url = _targets_opencode(holder)
-        if key and inject:
+        if key and _should_inject(provider, holder):
             header_name = TARGET_HEADER or HEADER_NAME
             headers = dict(kwargs.get("extra_headers") or {})
             # Canonical key first, so the dedupe below can never delete it.
@@ -321,11 +333,11 @@ def _install_create(
                 del headers[name]
             headers[header_name] = key
             kwargs["extra_headers"] = headers
-        elif key and not inject:
+        elif key:
             logger.debug(
-                "skipped X-Opencode-Session injection: base_url %r does not match "
-                "the configured host keywords %s",
-                url,
+                "skipped X-Opencode-Session injection: provider identity/url %s "
+                "does not match the configured keywords %s",
+                _provider_identity_strings(provider, holder),
                 HOST_KEYWORDS,
             )
         return await original(*args, **kwargs)
@@ -534,7 +546,7 @@ class OpencodeSessionPlugin(Star):
                 the plugin declares no schema.
         """
         super().__init__(context)
-        global TARGET_HEADER, HOST_KEYWORDS, MATCH_FULL_URL
+        global TARGET_HEADER, FILTER_ENABLED, HOST_KEYWORDS
 
         if isinstance(config, dict):
             header = config.get("target_header")
@@ -543,20 +555,19 @@ class OpencodeSessionPlugin(Star):
             else:
                 TARGET_HEADER = HEADER_NAME
 
+            FILTER_ENABLED = bool(config.get("filter_enabled", False))
+
             keywords = config.get("host_keywords")
             if isinstance(keywords, (list, tuple)):
-                cleaned = tuple(
+                HOST_KEYWORDS = tuple(
                     str(item).strip().lower() for item in keywords if str(item).strip()
                 )
-                HOST_KEYWORDS = cleaned
-
-            MATCH_FULL_URL = bool(config.get("match_full_url", False))
 
         logger.debug(
-            "opencode session injection target: header=%s keywords=%s match_full_url=%s",
+            "opencode session injection target: header=%s filter_enabled=%s keywords=%s",
             TARGET_HEADER,
+            FILTER_ENABLED,
             HOST_KEYWORDS,
-            MATCH_FULL_URL,
         )
 
     @filter.on_llm_request()

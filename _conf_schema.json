@@ -1,22 +1,22 @@
 {
+  "filter_enabled": {
+    "description": "只对匹配的提供商注入（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭（默认）：对所有 OpenAI 兼容的提供商都注入该头，最不容易出错——请求经自建中转时，按地址筛选会静默失效。开启：只有「提供商 ID、提供商类型、或 base_url」中包含下面任一关键字的提供商才会被注入，其它提供商一律不加。"
+  },
   "host_keywords": {
-    "description": "生效的提供商域名关键字",
+    "description": "匹配关键字（仅在开启筛选时生效）",
     "type": "list",
     "default": [
       "opencode"
     ],
-    "hint": "只有 base_url 匹配这些关键字的提供商才会被注入请求头，其它提供商（OpenAI、DeepSeek、本地 Ollama 等）一律不加，避免把会话 ID 发给无关服务。留空表示对所有提供商都注入。若你走的是自建中转，请把中转域名（或其中的一段）加进来。"
-  },
-  "match_full_url": {
-    "description": "匹配整个 URL（而非仅域名）",
-    "type": "bool",
-    "default": false,
-    "hint": "关闭时只拿 URL 的域名部分去匹配关键字；开启时用完整 URL 匹配。官方直连或域名含 opencode 时关闭即可；自建中转的域名不含 opencode、但其路径里含 opencode 时，可开启此项。"
+    "hint": "依次在提供商 ID、提供商类型、base_url 中查找，不区分大小写，命中任意一个即可。注意：请求若经过你自己的中转，base_url 常是内网地址、与上游域名无关，但提供商 ID（如 opencode/deepseek-v4-flash）通常仍能匹配上。"
   },
   "target_header": {
     "description": "注入的请求头名称",
     "type": "string",
     "default": "X-Opencode-Session",
-    "hint": "默认 X-Opencode-Session。除非你对接的是别的兼容网关，否则不要改。注意大小写需要与上游要求完全一致：SDK 合并请求头时是区分大小写的，写成别的大小写会导致重复头而非覆盖。"
+    "hint": "默认 X-Opencode-Session。除非你对接的是别的兼容网关，否则不要改。注意大小写需要与上游要求完全一致：SDK 合并请求头时区分大小写，写成别的大小写会导致重复头而非覆盖。"
   }
 }
