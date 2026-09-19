@@ -253,12 +253,32 @@ def _targets_opencode(holder: Any) -> tuple[bool, str]:
     return any(keyword in haystack for keyword in HOST_KEYWORDS), url
 
 
+def _provider_stable_key(provider: Any) -> str:
+    """Derive a stable per-provider value.
+
+    Args:
+        provider: Provider instance owning the wrapped callable.
+
+    Returns:
+        A deterministic UUIDv5 string, or "" when it cannot be derived.
+    """
+    try:
+        label = getattr(provider.meta(), "id", None)
+    except Exception:
+        label = None
+    if not label:
+        label = type(provider).__name__
+    cleaned = _clean(label)
+    return _derive(cleaned) if cleaned else ""
+
+
 def _install_create(
     holder: Any,
     label: str,
     method: str,
     current: Any,
     originals: dict[str, Any],
+    provider: Any = None,
 ) -> None:
     """Install the header injection wrapper on one client entry point.
 
@@ -269,13 +289,24 @@ def _install_create(
         method: Attribute name to replace, e.g. ``create`` or ``list``.
         current: The currently bound callable.
         originals: Per-provider map of label to the original callable.
+        provider: Provider instance owning the client.
     """
     original = originals.get(label) or current
     originals[label] = original
+    # ``models.list`` carries no conversation context when the dashboard calls it
+    # (``provider.get_models()``, config_service.py:1735, outside the LLM
+    # pipeline). Upstream rejects a request whose session header is missing, so
+    # this one path falls back to a fresh identifier rather than sending
+    # nothing. The value is deliberately *not* stable across calls: every other
+    # path keeps the "no session identity => no header" rule, and a single
+    # shared constant would make unrelated requests look like one session.
+    is_contextless = method == "list"
 
     @functools.wraps(original)
     async def create_wrapper(*args: Any, **kwargs: Any) -> Any:
         key = SESSION_KEY.get()
+        if not key and is_contextless:
+            key = str(uuid.uuid4())
         inject, url = _targets_opencode(holder)
         if key and inject:
             header_name = TARGET_HEADER or HEADER_NAME
@@ -447,6 +478,7 @@ def wrap_provider(provider: Any) -> bool:
             method,
             current,
             originals,
+            provider,
         )
         wrapped = True
     for name in _TEXT_METHODS:
