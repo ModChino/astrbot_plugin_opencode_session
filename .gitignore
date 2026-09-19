@@ -13,13 +13,3 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
-
-# 仅本地保留的开发与审计材料，不进仓库
-#
-# 说明：AstrBot 插件生态的惯例是仓库只放插件本体（main.py / metadata.yaml /
-# _conf_schema.json / requirements.txt / README.md / LICENSE），抽样多个插件仓库
-# 均无 tests/ 目录。这几项仍保留在工作区中以便本地回归与追溯，只是不提交。
-# 注意：仅添加规则对已跟踪文件无效，需配合 `git rm --cached` 取消跟踪。
-tests/
-REQUIREMENTS.md
-VERIFICATION.md
