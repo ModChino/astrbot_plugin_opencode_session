@@ -20,7 +20,7 @@ import functools
 import inspect
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import filter
 from astrbot.api.star import Star
@@ -81,15 +81,6 @@ WARNED_ATTR = "__oc_session_case_warned__"
 _HTTP_MARK_ATTR = "__oc_session_http_marked__"
 """Marks the patched ``AsyncOpenAI.__init__`` so it is never stacked twice."""
 
-CONTEXTLESS_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "opencode_session_contextless_key",
-    default="",
-)
-"""Value for requests that carry no conversation (see :func:`_contextless_key`)."""
-
-_session_id_resolver: Callable[[], str] | None = None
-"""Late-bound so the transport patch can resolve it without touching the module."""
-
 _wrap_targets: list[Any] = []
 """Providers this plugin has wrapped, used to reach their httpx clients."""
 
@@ -97,14 +88,9 @@ _openai_original_init: Any = None
 _openai_patched_cls: Any = None
 """Bookkeeping for the ``AsyncOpenAI.__init__`` patch."""
 
-_CREATE_CHAINS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("chat", "completions"), "create"),
-    (("responses",), "create"),
-    # ``GET /models`` is a separate resource, but AstrBot's provider "test"
-    # button reaches it through ``provider.get_models()``
-    # (openai_source.py:437-447 -> client.models.list). Upstream rejects that
-    # request too when the session header is absent, so it must be wrapped.
-    (("models",), "list"),
+_CREATE_CHAINS: tuple[tuple[str, ...], ...] = (
+    ("chat", "completions"),
+    ("responses",),
 )
 _TEXT_METHODS = ("text_chat", "text_chat_stream")
 _MAX_KEY_LENGTH = 128
@@ -205,23 +191,19 @@ def _apply_session_from_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> N
     SESSION_KEY.set(_derive(session_id))
 
 
-def _iter_creates(client: Any) -> Iterator[tuple[tuple[tuple[str, ...], str], Any, Any]]:
-    """Yield every request entry point of an OpenAI-style client.
-
-    Not just ``create``: ``models.list`` is a second outbound path that AstrBot
-    reaches when fetching the model list, and it needs the same header.
+def _iter_creates(client: Any) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
+    """Yield every ``create`` callable of an OpenAI-style client.
 
     Args:
         client: Candidate SDK client; ``None`` yields nothing.
 
     Yields:
-        ``((attribute_chain, method), holder, callable)`` triples. Chains are
-        resolved dynamically, so a client without ``responses`` or ``models``
-        degrades silently.
+        ``(attribute_chain, holder, callable)`` triples. Chains are resolved
+        dynamically, so a client without ``responses`` degrades silently.
     """
     if client is None:
         return
-    for chain, method in _CREATE_CHAINS:
+    for chain in _CREATE_CHAINS:
         holder = client
         for attribute in chain:
             holder = getattr(holder, attribute, None)
@@ -229,9 +211,9 @@ def _iter_creates(client: Any) -> Iterator[tuple[tuple[tuple[str, ...], str], An
                 break
         if holder is None:
             continue
-        func = getattr(holder, method, None)
+        func = getattr(holder, "create", None)
         if callable(func):
-            yield (chain, method), holder, func
+            yield chain, holder, func
 
 
 def _resource_url(holder: Any) -> str:
@@ -447,41 +429,31 @@ def _install_on_client(client: Any) -> None:
     for name in headers:
         if str(name).lower() == header_name.lower():
             return
-    default = _clean(CONTEXTLESS_SESSION_ID)
-    if not default:
-        return  # strict mode: no configured default means no header
-    headers[header_name] = default
+    headers[header_name] = _contextless_key()
 
 
 def _install_create(
     holder: Any,
     label: str,
-    method: str,
     current: Any,
     originals: dict[str, Any],
     provider: Any = None,
 ) -> None:
-    """Install the header injection wrapper on one client entry point.
+    """Install the header injection wrapper on one ``create`` entry point.
 
     Args:
-        holder: Object owning the callable (a completions/responses/models
-            resource).
+        holder: Object owning the callable (a completions/responses resource).
         label: Stable key used to remember the original callable.
-        method: Attribute name to replace, e.g. ``create`` or ``list``.
         current: The currently bound callable.
         originals: Per-provider map of label to the original callable.
         provider: Provider instance owning the client.
     """
     original = originals.get(label) or current
     originals[label] = original
-    # Model-list requests carry no conversation when the dashboard asks for them,
-    # so this one path falls back to a configured constant instead of sending
-    # nothing. Every other path keeps the "no session identity => no header" rule.
-    is_contextless = method == "list"
 
     @functools.wraps(original)
     async def create_wrapper(*args: Any, **kwargs: Any) -> Any:
-        key = SESSION_KEY.get() or (CONTEXTLESS_KEY.get() if is_contextless else "")
+        key = SESSION_KEY.get()
         if key and _should_inject(provider, holder):
             header_name = TARGET_HEADER or HEADER_NAME
             headers = dict(kwargs.get("extra_headers") or {})
@@ -505,7 +477,7 @@ def _install_create(
             )
         return await original(*args, **kwargs)
 
-    setattr(holder, method, create_wrapper)
+    setattr(holder, "create", create_wrapper)
 
 
 def _install_text_method(
@@ -646,11 +618,10 @@ def wrap_provider(provider: Any) -> bool:
 
     wrapped = False
     client = getattr(provider, "client", None)
-    for (chain, method), holder, current in _iter_creates(client):
+    for chain, holder, current in _iter_creates(client):
         _install_create(
             holder,
-            ".".join((*chain, method)),
-            method,
+            ".".join((*chain, "create")),
             current,
             originals,
             provider,
@@ -744,7 +715,6 @@ class OpencodeSessionPlugin(Star):
 
             RANDOM_CONTEXTLESS = bool(config.get("random_contextless_value", False))
 
-        CONTEXTLESS_KEY.set(_contextless_key())
         self._plugin_config = config if isinstance(config, dict) else None
         self._register_page_api()
 
@@ -812,7 +782,6 @@ class OpencodeSessionPlugin(Star):
 
         global CONTEXTLESS_SESSION_ID
         CONTEXTLESS_SESSION_ID = value.strip()
-        CONTEXTLESS_KEY.set(_contextless_key())
 
         saved = False
         config = getattr(self, "_plugin_config", None)

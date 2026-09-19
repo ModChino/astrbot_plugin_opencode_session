@@ -35,20 +35,20 @@ AstrBot 的自定义请求头是在 **provider 初始化时构建一次**的静�
 
 插件在请求出站前按当前对话链动态生成 `X-Opencode-Session` 并注入，取值来自该对话链的 `Conversation.cid`，**不改动 AstrBot 主程序**，也不改写共享 client 的全局状态。
 
-注入走**两层机制 + 三条请求路径**，以确保都被覆盖：
+注入分**两层**，覆盖两类情形：
 
-1. **`on_llm_request` 钩子**：正常经由 AstrBot LLM 请求流水线的调用，会在钩子处被注入该头。
-2. **对 provider 的 `text_chat` / `text_chat_stream` 做实例级兜底包装**：对不经过上述钩子的调用路径，插件在同一 provider 实例的方法上再包一层，仍然按当前会话注入该头。
+1. **按对话链注入**：`on_llm_request` 钩子记录当前会话的 `cid`，随后被包装的 `create` 调用把它写进本次请求的 `extra_headers`。这样同一对话的多轮请求共用一个值。
+2. **客户端默认值**：插件给每个 SDK client 的 `default_headers` 写入一个默认值。**凡是插件没有包装到的请求路径，都由这个默认值兜底**——最典型的是 WebUI 里点「测试」拉取模型列表：AstrBot 会临时新建一个 provider 实例再直接调用（`dashboard/services/config_service.py:1694`），插件完全没有机会包装它。
 
-被包装的**出站请求路径**有三条，缺一不可：
+被包装的**对话出站路径**有两条，外加 `text_chat` / `text_chat_stream` 兜底：
 
 | 路径 | 对应 AstrBot 行为 |
 | --- | --- |
 | `chat.completions.create` | 正常的对话补全请求 |
 | `responses.create` | OpenAI Responses 类型的 provider |
-| **`models.list`** | **WebUI 里点「测试」/ 拉取模型列表**（`provider.get_models()`，`openai_source.py:437-447`） |
+| `text_chat` / `text_chat_stream`（实例级） | 不经过钩子、直接调用 provider 的路径（例如其它插件自己调 LLM） |
 
-> 第 3 条是 v1.0.1 修复的：早期版本只包装了 `create`，导致在 WebUI 点「测试」时请求不带该头，上游返回 `400 MissingSessionID`。对话功能不受影响，只有模型列表这条路径会失败。
+> **模型列表（`models.list`）不在包装范围内**，它由第 2 层的客户端默认值覆盖。早期版本曾专门包装过它，后来验证发现那层包装根本到不了真正出问题的那条路径（临时实例从未被包装），属于多余机制，已移除。
 
 用户侧无需关心这些差别，它们对使用者是等价的。列出来只是为了如实说明该头在**哪几条路径上会被注入**。
 
@@ -262,7 +262,7 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 
 ## 7. 已知限制
 
-- **覆盖范围**：目前仅覆盖 OpenAI Chat Completions（`astrbot/core/provider/sources/openai_source.py`）与 Responses（`astrbot/core/provider/sources/openai_responses_source.py`）两类 provider，覆盖其 `chat.completions.create`、`responses.create` 与 `models.list` 三条出站路径。Anthropic、Gemini 等其他 provider 的请求链路不在覆盖范围内，对这些 provider 该头不会被注入。
+- **覆盖范围**：目前仅覆盖 OpenAI Chat Completions（`astrbot/core/provider/sources/openai_source.py`）与 Responses（`astrbot/core/provider/sources/openai_responses_source.py`）两类 provider 的 `create` 调用。Anthropic、Gemini 等其他 provider 的请求链路不在覆盖范围内。模型列表等未包装的路径由**客户端默认值**兜底（见第 1.3 节）。
 - **上游校验强度**：上游目前对该头只做非空校验；上游表示未来会校验 UUID 格式。本插件产出的取值来自 `Conversation.cid`，正是 UUID 形态（`astrbot/core/db/po.py:569`），因此未来收紧校验时无需改动。
 - **不修改 AstrBot 主程序**：插件只做运行时注入，不改变 `custom_headers` 的静态语义；AstrBot 升级若调整 provider 请求链路，插件可能需要跟进。
 - **不代替 API Key 与 UA 配置**：插件只负责会话标识，上游要求的其余头（尤其是 `user-agent`）仍需你自行在 provider 配置中补齐。
@@ -281,7 +281,7 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | 重载了但行为没变化 | 先确认真的重载成功（卡片状态、日志无报错）；必要时重启 AstrBot 进程。 |
 | webhook.site 收不到任何请求 | 说明请求根本没发出去：检查该 provider 的 `api_base` 是否填对、`api_key` 是否非空、AstrBot 是否确实路由到了这个 provider。 |
 | 收到了请求，但找不到 `x-opencode-session` | 该 provider 类型不在覆盖范围内（见第 7 节）；或请求没走 LLM provider 链路。 |
-| WebUI 点「测试」报 `400 MissingSessionID`，但对话正常 | v1.0.0 的已知缺陷：模型列表走的是 `client.models.list()`，早期版本未包装该路径。**升级到 v1.0.1 或更高**即可。 |
+| WebUI 点「测试」报 `400 MissingSessionID`，但对话正常 | 模型列表由客户端默认值兜底（见第 1.3 节）。请确认 `contextless_session_id` 非空、以及 `_conf_schema.json` 已随插件一起更新（**升级到 v1.3.0 或更高**）。 |
 | 头存在，但值总是同一个 | 检查是否在 `custom_headers` 里写死了 `X-Opencode-Session`（见第 2 节）。在**规范大小写**下插件会在出站时无条件覆盖该头，所以正常情况下你看到的不会是写死的那串；如果看到的恰好就是写死值，说明插件没有加载成功、注入链路没生效，或该头被写成了非规范大小写（见下一行），请先按规范大小写配置或直接删掉该配置项后重来。 |
 | 插件装了但缓存亲和性没效果 / 抓包看到重复的 session 头 | `custom_headers` 中该头使用了**非规范大小写**（如 `x-opencode-session`、`X-OPENCODE-SESSION`），导致 SDK 精确键合并不上、出站出现两个头（实测值形如 `['HARDCODED', 'cid-lower']`）。此时**插件无法保证覆盖成功、结果未定义**：插件的值在写死值之后，但上游取首值还是末值取决于实现（httpx 标量取末值，许多反向代理 / 服务端**取首值**）。处理：改为规范大小写 `X-Opencode-Session`，或从 `custom_headers` 中删除该配置项。插件会就此打一条英文 warning（每个 provider 实例最多一次），但不会替你改配置。 |
 | 抓包发现该头整个缺失（不是重复） | 两种情况，按可能性排序：①`match_mode` 选的是 `base_url` 而该 provider 的地址不匹配 `host_keywords`（**走自建中转最常见的坑**，改成 `provider_id` 即可，见第 4.3 节）；②本次请求三个会话键来源全为空，插件按设计**省略**该头（见第 7 节）。插件日志会以 debug 级记录匹配用的字段与值，一看即知。 |
@@ -341,7 +341,7 @@ uv run --no-project python astrbot_plugin_opencode_session/tests/test_host_filte
 | --- | --- | --- | --- |
 | `test_injection.py` | 30 | 30 PASS / exit 0 | 会话键取值与注入、并发不串台、包装幂等、规范大小写覆盖、非规范大小写只告警不改配置、`client._custom_headers` 前后全等 |
 | `test_fallback.py` | 21 | 21 PASS / exit 0 | 三级回退链、三来源全空时省略头且不退化为常量、无落盘状态、钩子外兜底路径 |
-| `test_host_filter.py` | 35 | 35 PASS / exit 0 | 默认 `base_url` 模式、三种模式各自的命中与跳过、**中转场景下 `provider_id` 模式命中**、模式非法时回退 `base_url`、大小写不敏感、关键字留空不失效、`models.list` 包装与无会话时的兜底、**会话路径仍严格遵守「无身份不发头」**、`target_header` 可配、`_conf_schema.json` 结构 |
+| `test_host_filter.py` | 42 | 42 PASS / exit 0 | 默认 `base_url` 模式、三种模式各自的命中与跳过、**中转场景下 `provider_id` 模式命中**、模式非法时回退 `base_url`、大小写不敏感、关键字留空不失效、**客户端默认值的安装与随机开关**、`models.list` 不再被包装、**会话路径仍严格遵守「无身份时不写 extra_headers」**、`target_header` 可配、`_conf_schema.json` 结构 |
 
 关于测试可信度：`test_injection.py` / `test_fallback.py` 做过**负向对照**——把 `main.py` 复制一份、故意注入缺陷后重跑，确认测试会失败且失败项精确对应缺陷（而不是"永远全绿"）。复现步骤与实测数字写在 `test_fallback.py` 的模块 docstring 里。注意两套测试的检测范围并不重合（前者能抓覆盖缺陷、后者不能），所以**都要跑**；`test_host_filter.py` 覆盖的是注入范围与配置，与上述两者同样不重合。
 
