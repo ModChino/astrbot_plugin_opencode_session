@@ -20,7 +20,7 @@ import functools
 import inspect
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from astrbot.api.event import filter
 from astrbot.api.star import Star
@@ -52,6 +52,12 @@ TARGET_HEADER: str = HEADER_NAME
 MATCH_MODE: str = "base_url"
 HOST_KEYWORDS: tuple[str, ...] = ("opencode",)
 MATCH_MODES: tuple[str, ...] = ("base_url", "provider_id", "provider_type")
+TRANSPORT_INJECT: bool = True
+CONTEXTLESS_SESSION_ID: str = "test"
+RANDOM_CONTEXTLESS: bool = False
+"""When set, every contextless request gets its own fresh UUID."""
+
+PLUGIN_NAME = "astrbot_plugin_opencode_session"
 
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
@@ -72,6 +78,24 @@ already resolved from ``conversation.cid`` into ``uuid5(session_id)``.
 WRAP_FLAG = "__oc_session_wrapped__"
 ORIGINALS_ATTR = "__oc_session_originals__"
 WARNED_ATTR = "__oc_session_case_warned__"
+_HTTP_MARK_ATTR = "__oc_session_http_marked__"
+"""Marks the patched ``AsyncOpenAI.__init__`` so it is never stacked twice."""
+
+CONTEXTLESS_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "opencode_session_contextless_key",
+    default="",
+)
+"""Value for requests that carry no conversation (see :func:`_contextless_key`)."""
+
+_session_id_resolver: Callable[[], str] | None = None
+"""Late-bound so the transport patch can resolve it without touching the module."""
+
+_wrap_targets: list[Any] = []
+"""Providers this plugin has wrapped, used to reach their httpx clients."""
+
+_openai_original_init: Any = None
+_openai_patched_cls: Any = None
+"""Bookkeeping for the ``AsyncOpenAI.__init__`` patch."""
 
 _CREATE_CHAINS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("chat", "completions"), "create"),
@@ -285,6 +309,150 @@ def _should_inject(provider: Any, holder: Any) -> bool:
     return any(keyword in candidate for keyword in HOST_KEYWORDS)
 
 
+def _contextless_key() -> str:
+    """Return the value used when a request carries no conversation context.
+
+    The dashboard's model-list test builds a throwaway provider instance
+    (``dashboard/services/config_service.py:1694``) that this plugin never wraps,
+    and it must still send a non-empty value because upstream answers
+    ``400 MissingSessionID`` otherwise.
+
+    Three modes, in order of precedence:
+
+    1. ``random_contextless_value`` on -- a fresh UUID per request. This never
+       collides with a real conversation's cache and never makes unrelated test
+       requests look like one session.
+    2. a configured ``contextless_session_id``.
+    3. a random UUID, when the configured value is blank.
+
+    Returns:
+        A non-empty header-safe string.
+    """
+    if RANDOM_CONTEXTLESS:
+        return str(uuid.uuid4())
+    configured = _clean(CONTEXTLESS_SESSION_ID)
+    return configured if configured else str(uuid.uuid4())
+
+
+def install_http_injector() -> None:
+    """Make sure every SDK client carries a default value for the header.
+
+    The plugin normally injects per conversation through the SDK's per-call
+    ``extra_headers``, but that only reaches clients it has wrapped. The
+    dashboard's model-list test builds a throwaway provider instance
+    (``dashboard/services/config_service.py:1694``) and calls ``get_models()``
+    directly, so no wrapper is involved.
+
+    Two things cover that path:
+
+    1. already-live clients are given the default now, and
+    2. ``AsyncOpenAI.__init__`` is patched so clients created later -- including
+       that throwaway instance, which is built while the request is served -- get
+       the default too.
+    """
+    _install_openai_ctor_patch()
+    for holder in _sdk_clients():
+        _install_on_client(holder)
+
+
+def _install_openai_ctor_patch() -> None:
+    """Patch ``AsyncOpenAI.__init__`` so new clients get the transport tag."""
+    global _openai_original_init, _openai_patched_cls
+    if not TRANSPORT_INJECT:
+        return
+    try:
+        from openai import AsyncOpenAI
+    except Exception:
+        return
+    current = AsyncOpenAI.__init__
+    if getattr(current, _HTTP_MARK_ATTR, False):
+        return  # already patched by this module
+    _openai_original_init = current
+    _openai_patched_cls = AsyncOpenAI
+
+    @functools.wraps(current)
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        current(self, *args, **kwargs)
+        try:
+            _install_on_client(self)
+        except Exception:
+            logger.debug("could not tag a new SDK client", exc_info=True)
+
+    setattr(patched_init, _HTTP_MARK_ATTR, True)
+    AsyncOpenAI.__init__ = patched_init
+
+
+def _remove_openai_ctor_patch() -> None:
+    """Restore the original ``AsyncOpenAI.__init__``."""
+    global _openai_original_init, _openai_patched_cls
+    if _openai_patched_cls is not None and _openai_original_init is not None:
+        _openai_patched_cls.__init__ = _openai_original_init
+    _openai_original_init = None
+    _openai_patched_cls = None
+
+
+async def remove_http_injector() -> None:
+    """Undo :func:`install_http_injector`.
+
+    Only the constructor patch is removed. A default header already written into
+    a client's ``_custom_headers`` is left alone: the plugin never replaces a
+    value the user configured, and unwrapping cannot tell the two apart.
+    """
+    _remove_openai_ctor_patch()
+
+
+def _sdk_clients() -> list[Any]:
+    """Return every live OpenAI SDK client this plugin should tag requests for.
+
+    The providers currently held by AstrBot are the reliable source; clients
+    created and discarded elsewhere (the dashboard's model-list test) are covered
+    by the ``AsyncOpenAI`` constructor patch instead.
+
+    Returns:
+        Candidate SDK client objects, ignoring anything unusable.
+    """
+    clients: list[Any] = []
+    for provider in _wrap_targets:
+        client = getattr(provider, "client", None)
+        if client is not None and client not in clients:
+            clients.append(client)
+    return clients
+
+
+def _install_on_client(client: Any) -> None:
+    """Give one SDK client a default value for the session header.
+
+    Writing ``_custom_headers`` covers **every** request that client will ever
+    make, including paths this plugin never wraps -- which is exactly what the
+    dashboard's model-list test needs, because it builds a throwaway provider
+    instance and calls ``get_models()`` directly.
+
+    The per-conversation value still wins wherever the plugin does wrap a call:
+    ``create_wrapper`` puts the same canonical key into ``extra_headers``, and the
+    SDK's case-sensitive merge lets the per-call value override this default.
+
+    Args:
+        client: An ``AsyncOpenAI``-alike exposing ``_custom_headers``.
+    """
+    if not TRANSPORT_INJECT:
+        return
+    headers = getattr(client, "_custom_headers", None)
+    if not isinstance(headers, dict):
+        return
+    header_name = TARGET_HEADER or HEADER_NAME
+    # Case-insensitive on purpose: adding the canonical spelling next to a
+    # differently-cased entry the user already configured would produce two
+    # headers on the wire instead of one, which is the exact failure this plugin
+    # exists to avoid.
+    for name in headers:
+        if str(name).lower() == header_name.lower():
+            return
+    default = _clean(CONTEXTLESS_SESSION_ID)
+    if not default:
+        return  # strict mode: no configured default means no header
+    headers[header_name] = default
+
+
 def _install_create(
     holder: Any,
     label: str,
@@ -306,20 +474,14 @@ def _install_create(
     """
     original = originals.get(label) or current
     originals[label] = original
-    # ``models.list`` carries no conversation context when the dashboard calls it
-    # (``provider.get_models()``, config_service.py:1735, outside the LLM
-    # pipeline). Upstream rejects a request whose session header is missing, so
-    # this one path falls back to a fresh identifier rather than sending
-    # nothing. The value is deliberately *not* stable across calls: every other
-    # path keeps the "no session identity => no header" rule, and a single
-    # shared constant would make unrelated requests look like one session.
+    # Model-list requests carry no conversation when the dashboard asks for them,
+    # so this one path falls back to a configured constant instead of sending
+    # nothing. Every other path keeps the "no session identity => no header" rule.
     is_contextless = method == "list"
 
     @functools.wraps(original)
     async def create_wrapper(*args: Any, **kwargs: Any) -> Any:
-        key = SESSION_KEY.get()
-        if not key and is_contextless:
-            key = str(uuid.uuid4())
+        key = SESSION_KEY.get() or (CONTEXTLESS_KEY.get() if is_contextless else "")
         if key and _should_inject(provider, holder):
             header_name = TARGET_HEADER or HEADER_NAME
             headers = dict(kwargs.get("extra_headers") or {})
@@ -501,6 +663,11 @@ def wrap_provider(provider: Any) -> bool:
             wrapped = True
     if wrapped:
         setattr(provider, WRAP_FLAG, True)
+        if provider not in _wrap_targets:
+            _wrap_targets.append(provider)
+        # Tag the httpx layer too, so requests that never reach a wrapped method
+        # (the dashboard's throwaway model-list provider) still carry the header.
+        _install_on_client(client)
     _warn_case_variant_headers(provider)
     return wrapped
 
@@ -548,6 +715,7 @@ class OpencodeSessionPlugin(Star):
         """
         super().__init__(context)
         global TARGET_HEADER, MATCH_MODE, HOST_KEYWORDS
+        global TRANSPORT_INJECT, CONTEXTLESS_SESSION_ID, RANDOM_CONTEXTLESS
 
         if isinstance(config, dict):
             header = config.get("target_header")
@@ -565,11 +733,102 @@ class OpencodeSessionPlugin(Star):
                     str(item).strip().lower() for item in keywords if str(item).strip()
                 )
 
+            if "transport_inject" in config:
+                TRANSPORT_INJECT = bool(config.get("transport_inject"))
+
+            if "contextless_session_id" in config:
+                fallback = config.get("contextless_session_id")
+                CONTEXTLESS_SESSION_ID = (
+                    fallback.strip() if isinstance(fallback, str) else ""
+                )
+
+            RANDOM_CONTEXTLESS = bool(config.get("random_contextless_value", False))
+
+        CONTEXTLESS_KEY.set(_contextless_key())
+        self._plugin_config = config if isinstance(config, dict) else None
+        self._register_page_api()
+
         logger.debug(
-            "opencode session injection target: header=%s match_mode=%s keywords=%s",
+            "opencode session injection target: header=%s match_mode=%s keywords=%s "
+            "transport_inject=%s contextless_session_id=%r random_contextless=%s",
             TARGET_HEADER,
             MATCH_MODE,
             HOST_KEYWORDS,
+            TRANSPORT_INJECT,
+            CONTEXTLESS_SESSION_ID,
+            RANDOM_CONTEXTLESS,
+        )
+
+    def _register_page_api(self) -> None:
+        """Expose the helper page's backend endpoints.
+
+        The WebUI's schema form has no button widget, so generating a UUID for
+        ``contextless_session_id`` needs a small custom page. Registration is
+        best-effort: a missing or older Web API surface must not stop the plugin
+        from loading.
+        """
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            return
+        for route, handler, methods, desc in (
+            (
+                f"/{PLUGIN_NAME}/session-helpers",
+                self.page_session_helpers,
+                ["GET"],
+                "Read the contextless session id",
+            ),
+            (
+                f"/{PLUGIN_NAME}/session-helpers/save",
+                self.page_save_contextless_session_id,
+                ["POST"],
+                "Save the contextless session id",
+            ),
+        ):
+            try:
+                register(route, handler, methods, desc)
+            except Exception:
+                logger.debug("could not register %s", route, exc_info=True)
+
+    async def page_session_helpers(self) -> Any:
+        """Return the current ``contextless_session_id`` for the helper page."""
+        from astrbot.api.web import json_response
+
+        return json_response(
+            {
+                "contextless_session_id": CONTEXTLESS_SESSION_ID,
+                "target_header": TARGET_HEADER,
+                "match_mode": MATCH_MODE,
+            }
+        )
+
+    async def page_save_contextless_session_id(self) -> Any:
+        """Persist a new ``contextless_session_id`` supplied by the helper page."""
+        from astrbot.api.web import error_response, json_response, request
+
+        payload = await request.json(default={})
+        value = payload.get("contextless_session_id")
+        if not isinstance(value, str):
+            return error_response("contextless_session_id must be a string")
+
+        global CONTEXTLESS_SESSION_ID
+        CONTEXTLESS_SESSION_ID = value.strip()
+        CONTEXTLESS_KEY.set(_contextless_key())
+
+        saved = False
+        config = getattr(self, "_plugin_config", None)
+        if isinstance(config, dict):
+            try:
+                config["contextless_session_id"] = CONTEXTLESS_SESSION_ID
+                config.save_config()
+                saved = True
+            except Exception:
+                logger.debug("could not persist the session id", exc_info=True)
+
+        return json_response(
+            {
+                "contextless_session_id": CONTEXTLESS_SESSION_ID,
+                "saved": saved,
+            }
         )
 
     @filter.on_llm_request()
@@ -597,17 +856,24 @@ class OpencodeSessionPlugin(Star):
             logger.debug("opencode session injection skipped", exc_info=True)
 
     async def initialize(self) -> None:
-        """Wrap the providers that already exist when the plugin is activated."""
+        """Wrap existing providers and start tagging the HTTP transport.
+
+        The transport patch is what covers the dashboard's model-list test, which
+        builds its own throwaway provider instance instead of reusing one of the
+        providers wrapped here.
+        """
         try:
             for provider in self.context.get_all_providers():
                 wrap_provider(provider)
+            install_http_injector()
         except Exception:
             logger.debug("opencode session prewrap skipped", exc_info=True)
 
     async def terminate(self) -> None:
-        """Restore the provider methods this plugin replaced."""
+        """Restore the provider methods and transport this plugin replaced."""
         try:
             for provider in self.context.get_all_providers():
                 unwrap_provider(provider)
+            await remove_http_injector()
         except Exception:
             logger.debug("opencode session unwrap skipped", exc_info=True)

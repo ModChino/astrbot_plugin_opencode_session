@@ -188,7 +188,13 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | --- | --- | --- | --- |
 | `match_mode` | 下拉单选 | **`base_url`** | 用哪个字段去匹配关键字，三选一：`base_url`（提供商地址）/ `provider_id`（提供商 ID）/ `provider_type`（提供商类型）。 |
 | `host_keywords` | 字符串列表 | `["opencode"]` | 在选定字段中查找这些关键字（不区分大小写），命中任意一个即注入。**留空 = 不筛选，对所有提供商都注入。** |
+| `contextless_session_id` | 字符串 | `test` | 「无对话链」的请求（如 WebUI 拉取模型列表的测试）所用的值。**必须非空**，否则上游返回 `400 MissingSessionID`。 |
+| `random_contextless_value` | 布尔 | `false` | 打开后，每次测试请求用一个**全新的 UUID**，而不是上面的固定值。 |
 | `target_header` | 字符串 | `X-Opencode-Session` | 注入的请求头名称。除非对接别的兼容网关，否则不要改。 |
+
+**为什么需要「无会话上下文」的默认值**：WebUI 里拉取模型列表的测试会**临时新建一个 provider 实例**（`dashboard/services/config_service.py:1694`）再直接调 `get_models()`，它不进入 LLM 流水线，因此插件无从得知是哪个会话。这条路径必须有个非空值，否则上游一律 `400 MissingSessionID`。
+
+> 小工具：插件提供了一个页面 **`会话默认值`**（WebUI 插件详情页里打开），可以直接改这个值，并有一个「随机 UUID」按钮一键生成。
 
 **三种匹配方式怎么选**：
 

@@ -23,6 +23,18 @@
     ],
     "hint": "在上面选定的字段中查找这些关键字（不区分大小写），命中任意一个即注入该头。**留空表示不筛选，对所有提供商都注入。**"
   },
+  "contextless_session_id": {
+    "description": "无会话上下文时使用的默认值",
+    "type": "string",
+    "default": "test",
+    "hint": "用于「没有对话链」的请求（例如 WebUI 里拉取模型列表的测试）。必须非空，否则上游会返回 400 MissingSessionID。留空则只发随机值。想每次随机可打开下一项。"
+  },
+  "random_contextless_value": {
+    "description": "每次测试请求随机生成 UUID",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后，每次「无会话上下文」的请求都会用一个全新的 UUID，而不是上面的固定默认值。这样测试请求彼此不会看起来像同一个会话，也不会与任何真实对话的缓存混淆。打开后上面的默认值仅在显示上保留、不再使用。"
+  },
   "target_header": {
     "description": "注入的请求头名称",
     "type": "string",
