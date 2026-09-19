@@ -278,6 +278,8 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 
 ## 9. 仓库结构
 
+仓库内只有插件本体与用户文档，与 AstrBot 插件生态的惯例一致：
+
 ```
 astrbot_plugin_opencode_session/
 ├── main.py              # 插件本体（全部逻辑，仅标准库）
@@ -285,19 +287,29 @@ astrbot_plugin_opencode_session/
 ├── metadata.yaml        # AstrBot 插件元数据（name 用下划线形式）
 ├── _conf_schema.json    # WebUI 配置表单（注入范围 / 头名，见第 4.3 节）
 ├── requirements.txt     # 依赖声明：无第三方依赖
-├── LICENSE              # MIT
-├── tests/
-│   ├── test_injection.py    # 回归测试：注入 / 并发隔离 / 幂等 / 覆盖与告警
-│   ├── test_fallback.py     # 回归测试：会话键回退链与防退化
-│   └── test_host_filter.py  # 回归测试：注入范围收窄与 WebUI 配置
-├── REQUIREMENTS.md      # 冻结的接口契约（每条结论带 AstrBot file:line）
-├── VERIFICATION.md      # 独立验证记录（含负向对照）
-└── README.md
+├── README.md
+└── LICENSE              # MIT
 ```
 
-**安装时 `main.py` / `__init__.py` / `metadata.yaml` / `_conf_schema.json` / `requirements.txt` 都必须带上**（少了 `_conf_schema.json` 就没有 WebUI 配置界面）；`tests/`、`LICENSE` 与三份 Markdown 是开发与审计资料，AstrBot 不会加载它们，留着不影响运行。
+**安装时必须带上 `main.py` / `__init__.py` / `metadata.yaml` / `_conf_schema.json` / `requirements.txt` 五项**（少了 `_conf_schema.json` 就没有 WebUI 配置界面）。
 
-## 10. 测试与可复核性
+### 9.1 仅本地保留的材料（不在仓库中）
+
+回归测试与审计文档**不随仓库分发**（`.gitignore` 已排除），维护者本地保留：
+
+| 路径 | 内容 |
+| --- | --- |
+| `tests/test_injection.py` | 注入 / 并发隔离 / 幂等 / 覆盖与告警（30 项） |
+| `tests/test_fallback.py` | 会话键回退链与防退化（21 项），含负向对照复现步骤 |
+| `tests/test_host_filter.py` | 注入范围收窄与 WebUI 配置（31 项） |
+| `REQUIREMENTS.md` | 冻结的接口契约（每条结论带 AstrBot `file:line`） |
+| `VERIFICATION.md` | 独立验证记录（含负向对照与裁决） |
+
+如果你是从仓库克隆下来使用的，那么**看不到这些文件是正常的**，它们只是开发期的回归与审计材料——插件本身不依赖它们。想在自己的环境里跑回归，需要从维护者处获取这三套脚本。
+
+## 10. 测试与可复核性（面向本地开发）
+
+> 本节所述测试脚本不在仓库中（见 9.1）。以下内容面向在本地持有这些脚本的开发/维护场景。
 
 三套回归测试都是自包含的：自带 fake `astrbot` 模块，用 `importlib` 按文件路径加载 `main.py`，因此**不需要安装 AstrBot、也不需要 pytest**，纯标准库运行。
 
