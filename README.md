@@ -1,4 +1,4 @@
-# astrbot-opencode-session
+# astrbot_plugin_opencode_session
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
@@ -95,7 +95,7 @@ AstrBot 的自定义请求头是在 **provider 初始化时构建一次**的静�
 
 ## 3. 安装
 
-插件目录名就是 `astrbot-opencode-session`，整个目录直接放进 AstrBot 的 `data/plugins/` 下即可（`data/plugins/<插件目录名>/main.py` 是 AstrBot 的插件发现规则）。
+插件目录名就是 `astrbot_plugin_opencode_session`，整个目录直接放进 AstrBot 的 `data/plugins/` 下即可（`data/plugins/<插件目录名>/main.py` 是 AstrBot 的插件发现规则）。
 
 放置后的目录结构应为（`main.py` 必须在插件目录根部，这是 AstrBot 的硬性要求；同目录下的其余文件照原样一起带过去）：
 
@@ -103,7 +103,7 @@ AstrBot 的自定义请求头是在 **provider 初始化时构建一次**的静�
 AstrBot/
 ├─ data/
 │  └─ plugins/
-│     └─ astrbot-opencode-session/
+│     └─ astrbot_plugin_opencode_session/
 │        ├─ __init__.py          # 使目录成为可导入的包
 │        ├─ main.py              # 插件入口（AstrBot 按此文件发现插件）
 │        ├─ metadata.yaml        # 插件元数据（名称、版本、作者等）
@@ -111,24 +111,24 @@ AstrBot/
 │        └─ requirements.txt     # 依赖声明（本插件不引入第三方依赖）
 ```
 
-把整个 `astrbot-opencode-session` 目录复制过去：
+把整个 `astrbot_plugin_opencode_session` 目录复制过去：
 
 ```powershell
 # Windows（在解压/克隆出的上级目录执行）
-Copy-Item -Recurse -Force '.\astrbot-opencode-session' '<AstrBot 路径>\data\plugins\'
+Copy-Item -Recurse -Force '.\astrbot_plugin_opencode_session' '<AstrBot 路径>\data\plugins\'
 ```
 
 ```bash
 # Linux / macOS
-cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
+cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 ```
 
 然后二选一使其生效：
 
-- **推荐：** 打开 AstrBot WebUI → `插件` 页面 → 找到 `astrbot-opencode-session` 卡片 → 点击刷新图标（`重载插件`）。若它掉进了 `加载失败插件` 列表，在该列表里点对应的 `重载` 按钮，并查看日志里的报错。
+- **推荐：** 打开 AstrBot WebUI → `插件` 页面 → 找到 `astrbot_plugin_opencode_session` 卡片 → 点击刷新图标（`重载插件`）。若它掉进了 `加载失败插件` 列表，在该列表里点对应的 `重载` 按钮，并查看日志里的报错。
 - 或者直接重启 AstrBot 进程。
 
-重载后确认插件状态为已激活、且日志中没有 `Failed to import plugin astrbot-opencode-session` 之类的错误。
+重载后确认插件状态为已激活、且日志中没有 `Failed to import plugin astrbot_plugin_opencode_session` 之类的错误。
 
 ---
 
@@ -172,7 +172,7 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 
 ### 4.3 插件配置（WebUI 可改）
 
-本插件提供 WebUI 配置表单（`_conf_schema.json`）。打开 **WebUI → `插件` → `astrbot-opencode-session` → 配置**（齿轮图标）即可修改，保存后立即生效、无需重启。
+本插件提供 WebUI 配置表单（`_conf_schema.json`）。打开 **WebUI → `插件` → `astrbot_plugin_opencode_session` → 配置**（齿轮图标）即可修改，保存后立即生效、无需重启。
 
 | 配置项 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
@@ -241,7 +241,7 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 
 ### 方法三：检查插件是否加载
 
-在 WebUI `插件` 页面确认 `astrbot-opencode-session` 处于已激活状态、无加载报错，即可排除「插件根本没跑」这一类问题。
+在 WebUI `插件` 页面确认 `astrbot_plugin_opencode_session` 处于已激活状态、无加载报错，即可排除「插件根本没跑」这一类问题。
 
 ---
 
@@ -261,7 +261,7 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 
 | 现象 | 排查方向 |
 | --- | --- |
-| WebUI `插件` 页面看不到本插件 | 确认目录是 `data/plugins/astrbot-opencode-session/`（路径写错一层是最常见的原因），且 `main.py` 位于该目录**根部**，不是嵌套在更深的子目录里。 |
+| WebUI `插件` 页面看不到本插件 | 确认目录是 `data/plugins/astrbot_plugin_opencode_session/`（路径写错一层是最常见的原因），且 `main.py` 位于该目录**根部**，不是嵌套在更深的子目录里。 |
 | 插件出现在 `加载失败插件` 列表 | 打开日志查看具体异常；在 `加载失败插件` 列表点击该插件的 `重载` 按钮重试；确认没有缺依赖、Python 版本过低等问题。 |
 | 重载了但行为没变化 | 先确认真的重载成功（卡片状态、日志无报错）；必要时重启 AstrBot 进程。 |
 | webhook.site 收不到任何请求 | 说明请求根本没发出去：检查该 provider 的 `api_base` 是否填对、`api_key` 是否非空、AstrBot 是否确实路由到了这个 provider。 |
@@ -279,7 +279,7 @@ cp -r ./astrbot-opencode-session /path/to/AstrBot/data/plugins/
 ## 9. 仓库结构
 
 ```
-astrbot-opencode-session/
+astrbot_plugin_opencode_session/
 ├── main.py              # 插件本体（全部逻辑，仅标准库）
 ├── __init__.py          # 包入口，重导出 OpencodeSessionPlugin
 ├── metadata.yaml        # AstrBot 插件元数据（name 用下划线形式）
@@ -302,9 +302,9 @@ astrbot-opencode-session/
 三套回归测试都是自包含的：自带 fake `astrbot` 模块，用 `importlib` 按文件路径加载 `main.py`，因此**不需要安装 AstrBot、也不需要 pytest**，纯标准库运行。
 
 ```bash
-uv run --no-project python astrbot-opencode-session/tests/test_injection.py
-uv run --no-project python astrbot-opencode-session/tests/test_fallback.py
-uv run --no-project python astrbot-opencode-session/tests/test_host_filter.py
+uv run --no-project python astrbot_plugin_opencode_session/tests/test_injection.py
+uv run --no-project python astrbot_plugin_opencode_session/tests/test_fallback.py
+uv run --no-project python astrbot_plugin_opencode_session/tests/test_host_filter.py
 ```
 
 在本仓库交付时点的实测结果（Python 3.14.6）：
