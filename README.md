@@ -1,5 +1,9 @@
 # astrbot-opencode-session
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
 按对话链动态注入 `X-Opencode-Session` 请求头的 AstrBot 插件。
 
 一句话说明：让 AstrBot 的每一次 LLM 请求都带上「当前这条对话链专属」的会话 ID，从而让 OpenCode Go 的 GPU 上下文缓存能按会话命中。
@@ -294,3 +298,11 @@ uv run --no-project python astrbot-opencode-session/tests/test_fallback.py
 | Responses provider | `astrbot/core/provider/sources/openai_responses_source.py` |
 | 对话链 `Conversation` / `cid` | `astrbot/core/db/po.py:558`, `:569` |
 | 插件发现规则（`data/plugins/<目录>/main.py`） | `astrbot/core/star/star_manager.py:204-205`, `:290-320` |
+
+## 12. 许可证
+
+本仓库以 **MIT License** 发布，全文见 [`LICENSE`](LICENSE)。
+
+关于边界的一个说明：本插件是**独立作品**，仅通过 AstrBot 的公开插件 API（`astrbot.api.*`）与其交互。AstrBot 本体采用 AGPL-3.0-or-later，**该许可不适用于本仓库**；本仓库的 MIT 授权仅覆盖本仓库自身的代码。
+
+如果你打算二次分发或用于商业用途，MIT 允许你自由使用、修改、闭源分发，只需保留本仓库的版权声明与许可证全文。软件按「原样」提供，不附带任何担保。

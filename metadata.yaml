@@ -1,5 +1,18 @@
 name: astrbot_plugin_opencode_session
 display_name: OpenCode 会话缓存头注入
-desc: 按对话链为每次 LLM 请求动态注入 X-Opencode-Session 请求头，使 OpenCode Go 能按会话命中 GPU 上下文缓存。
+short_desc: 按对话链动态注入 X-Opencode-Session，让 OpenCode Go 按会话命中 GPU 缓存
+desc: |-
+  按对话链为每次 LLM 请求动态注入 `X-Opencode-Session` 请求头，使 OpenCode Go 能按会话命中 GPU 上下文缓存（prompt / KV cache 亲和性调度）。
+
+  AstrBot 原生的「自定义请求头」是在 provider 初始化时构建一次的静态键值对，无法表达「每个会话一个值」。本插件改为在每次请求时按当前对话链推导会话 ID，并通过 SDK 的单次请求参数注入，因此：
+
+  - 同一会话内取值一致，不同会话彼此区分；
+  - 无需落盘映射表（取值由对话链确定性推导）；
+  - 全程只读取、绝不修改 provider / client 的共享请求头状态。
+
+  ⚠️ 请勿把 `X-Opencode-Session` 写死成固定值：写死会让所有会话共用一个 ID，缓存亲和性完全失效，并可能触发上游的异常风控特征。另外建议将 `user-agent` 配置为常见 agent 工具的值。
+
+  详见仓库 README 的安装、配置与验证章节。
 version: "1.0.0"
-author: placeholder
+author: ModChino
+repo: https://github.com/ModChino/astrbot-plugin-opencode-session
