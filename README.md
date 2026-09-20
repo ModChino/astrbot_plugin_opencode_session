@@ -4,6 +4,8 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
+> 📊 **交互式流程图**（缩放 / 搜索 / 路径聚焦 / 深浅色 / 三个引导视图）：https://modchino.github.io/astrbot_plugin_opencode_session/
+
 按对话链动态注入 `X-Opencode-Session` 请求头的 AstrBot 插件。
 
 一句话说明：让 AstrBot 的每一次 LLM 请求都带上「当前这条对话链专属」的会话 ID，从而让 OpenCode Go 的 GPU 上下文缓存能按会话命中。
