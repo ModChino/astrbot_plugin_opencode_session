@@ -188,13 +188,17 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | --- | --- | --- | --- |
 | `match_mode` | 下拉单选 | **`base_url`** | 用哪个字段去匹配关键字，三选一：`base_url`（提供商地址）/ `provider_id`（提供商 ID）/ `provider_type`（提供商类型）。 |
 | `host_keywords` | 字符串列表 | `["opencode"]` | 在选定字段中查找这些关键字（不区分大小写），命中任意一个即注入。**留空 = 不筛选，对所有提供商都注入。** |
-| `contextless_session_id` | 字符串 | `test` | 「无对话链」的请求（如 WebUI 拉取模型列表的测试）所用的值。填固定值则始终用它；**留空则每次请求自动生成随机 UUID**。 |
-| `random_contextless_value` | 布尔 | `false` | 打开后，每次测试请求用一个**全新的 UUID**，而不是上面的固定值。 |
+| `contextless_session_id` | 字符串 | `test` | 「无对话链」的请求（如 WebUI 拉取模型列表的测试）所用的值。填固定值则始终用它；**留空则在新建客户端时现生成随机 UUID**。 |
+| `random_contextless_value` | 布尔 | `false` | 打开后，每个新建的 SDK 客户端分到一个**随机 UUID**，取代上面的固定值（模型列表测试每次都新建客户端，因此每次都不同；同一个客户端复用期间取值不变）。 |
 | `target_header` | 字符串 | `X-Opencode-Session` | 注入的请求头名称。除非对接别的兼容网关，否则不要改。 |
 
 **为什么需要「无会话上下文」的默认值**：WebUI 里拉取模型列表的测试会**临时新建一个 provider 实例**（`dashboard/services/config_service.py:1694`）再直接调 `get_models()`，它不进入 LLM 流水线，因此插件无从得知是哪个会话。这条路径必须有一个非空值，否则上游一律 `400 MissingSessionID`——该值由插件保证：填了就用填的，留空就现生成一个随机 UUID。
 
-**想要随机值怎么操作**：把 `contextless_session_id` 清空，或打开 `random_contextless_value` 开关，两者等效（都是每次请求现生成 UUID）。AstrBot 的配置表单只渲染文本框、开关这类固定控件，**插件无法在其中插入自定义按钮**（见第 7 节），所以「生成随机值」这一步由插件在请求时完成，不需要你手填。
+> 这个默认值写在 SDK 客户端的 `default_headers` 上（`main.py:430`），只在该客户端**第一次**被包装时写入一次（`:427-429` 有同名键就跳过）。所以它的粒度是**每个客户端**，不是每次请求。**对话链的取值不受它影响**：正常对话走 per-call `extra_headers`（`main.py:459`），用的是 `Conversation.cid`，在同名键上覆盖客户端默认值。
+>
+> 已知边界：客户端默认值是在 `AsyncOpenAI.__init__` 补丁里装的（`main.py:357`），那一刻拿不到 provider，因此**每个** SDK 客户端都会装。匹配 `match_mode` 的 provider 会被对话链覆盖；**不匹配的 provider 没人覆盖它**，其请求也会带上这个头。这是 dashboard 测试兜底的代价，属已知限制。
+
+**想要随机值怎么操作**：把 `contextless_session_id` 清空，或打开 `random_contextless_value` 开关，两者等效（都是「新建客户端时现生成一个 UUID」）。AstrBot 的配置表单只渲染文本框、开关这类固定控件，**插件无法在其中插入自定义按钮**（见第 7 节），所以「生成随机值」这一步由插件在建客户端时完成，不需要你手填。
 
 **三种匹配方式怎么选**：
 
