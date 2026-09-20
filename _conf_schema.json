@@ -24,10 +24,10 @@
     "hint": "在上面选定的字段中查找这些关键字（不区分大小写），命中任意一个即注入该头。**留空表示不筛选，对所有提供商都注入。**"
   },
   "contextless_session_id": {
-    "description": "无会话上下文时使用的默认值",
+    "description": "无会话上下文时使用的值",
     "type": "string",
     "default": "test",
-    "hint": "用于「没有对话链」的请求（例如 WebUI 里拉取模型列表的测试）。必须非空，否则上游会返回 400 MissingSessionID。留空则只发随机值。想每次随机可打开下一项。"
+    "hint": "用于「没有对话链」的请求（例如 WebUI 里点「测试」拉取模型列表）。填固定值就始终用它；**留空则每次请求自动生成一个随机 UUID**（不会因此报 400 MissingSessionID）。想把「每次随机」固定下来，也可以直接打开下一项开关。"
   },
   "random_contextless_value": {
     "description": "每次测试请求随机生成 UUID",

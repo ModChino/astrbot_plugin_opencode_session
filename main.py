@@ -57,8 +57,6 @@ CONTEXTLESS_SESSION_ID: str = "test"
 RANDOM_CONTEXTLESS: bool = False
 """When set, every contextless request gets its own fresh UUID."""
 
-PLUGIN_NAME = "astrbot_plugin_opencode_session"
-
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
     default="",
@@ -715,9 +713,6 @@ class OpencodeSessionPlugin(Star):
 
             RANDOM_CONTEXTLESS = bool(config.get("random_contextless_value", False))
 
-        self._plugin_config = config if isinstance(config, dict) else None
-        self._register_page_api()
-
         logger.debug(
             "opencode session injection target: header=%s match_mode=%s keywords=%s "
             "transport_inject=%s contextless_session_id=%r random_contextless=%s",
@@ -727,77 +722,6 @@ class OpencodeSessionPlugin(Star):
             TRANSPORT_INJECT,
             CONTEXTLESS_SESSION_ID,
             RANDOM_CONTEXTLESS,
-        )
-
-    def _register_page_api(self) -> None:
-        """Expose the helper page's backend endpoints.
-
-        The WebUI's schema form has no button widget, so generating a UUID for
-        ``contextless_session_id`` needs a small custom page. Registration is
-        best-effort: a missing or older Web API surface must not stop the plugin
-        from loading.
-        """
-        register = getattr(self.context, "register_web_api", None)
-        if not callable(register):
-            return
-        for route, handler, methods, desc in (
-            (
-                f"/{PLUGIN_NAME}/session-helpers",
-                self.page_session_helpers,
-                ["GET"],
-                "Read the contextless session id",
-            ),
-            (
-                f"/{PLUGIN_NAME}/session-helpers/save",
-                self.page_save_contextless_session_id,
-                ["POST"],
-                "Save the contextless session id",
-            ),
-        ):
-            try:
-                register(route, handler, methods, desc)
-            except Exception:
-                logger.debug("could not register %s", route, exc_info=True)
-
-    async def page_session_helpers(self) -> Any:
-        """Return the current ``contextless_session_id`` for the helper page."""
-        from astrbot.api.web import json_response
-
-        return json_response(
-            {
-                "contextless_session_id": CONTEXTLESS_SESSION_ID,
-                "target_header": TARGET_HEADER,
-                "match_mode": MATCH_MODE,
-            }
-        )
-
-    async def page_save_contextless_session_id(self) -> Any:
-        """Persist a new ``contextless_session_id`` supplied by the helper page."""
-        from astrbot.api.web import error_response, json_response, request
-
-        payload = await request.json(default={})
-        value = payload.get("contextless_session_id")
-        if not isinstance(value, str):
-            return error_response("contextless_session_id must be a string")
-
-        global CONTEXTLESS_SESSION_ID
-        CONTEXTLESS_SESSION_ID = value.strip()
-
-        saved = False
-        config = getattr(self, "_plugin_config", None)
-        if isinstance(config, dict):
-            try:
-                config["contextless_session_id"] = CONTEXTLESS_SESSION_ID
-                config.save_config()
-                saved = True
-            except Exception:
-                logger.debug("could not persist the session id", exc_info=True)
-
-        return json_response(
-            {
-                "contextless_session_id": CONTEXTLESS_SESSION_ID,
-                "saved": saved,
-            }
         )
 
     @filter.on_llm_request()

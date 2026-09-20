@@ -188,13 +188,13 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | --- | --- | --- | --- |
 | `match_mode` | 下拉单选 | **`base_url`** | 用哪个字段去匹配关键字，三选一：`base_url`（提供商地址）/ `provider_id`（提供商 ID）/ `provider_type`（提供商类型）。 |
 | `host_keywords` | 字符串列表 | `["opencode"]` | 在选定字段中查找这些关键字（不区分大小写），命中任意一个即注入。**留空 = 不筛选，对所有提供商都注入。** |
-| `contextless_session_id` | 字符串 | `test` | 「无对话链」的请求（如 WebUI 拉取模型列表的测试）所用的值。**必须非空**，否则上游返回 `400 MissingSessionID`。 |
+| `contextless_session_id` | 字符串 | `test` | 「无对话链」的请求（如 WebUI 拉取模型列表的测试）所用的值。填固定值则始终用它；**留空则每次请求自动生成随机 UUID**。 |
 | `random_contextless_value` | 布尔 | `false` | 打开后，每次测试请求用一个**全新的 UUID**，而不是上面的固定值。 |
 | `target_header` | 字符串 | `X-Opencode-Session` | 注入的请求头名称。除非对接别的兼容网关，否则不要改。 |
 
-**为什么需要「无会话上下文」的默认值**：WebUI 里拉取模型列表的测试会**临时新建一个 provider 实例**（`dashboard/services/config_service.py:1694`）再直接调 `get_models()`，它不进入 LLM 流水线，因此插件无从得知是哪个会话。这条路径必须有个非空值，否则上游一律 `400 MissingSessionID`。
+**为什么需要「无会话上下文」的默认值**：WebUI 里拉取模型列表的测试会**临时新建一个 provider 实例**（`dashboard/services/config_service.py:1694`）再直接调 `get_models()`，它不进入 LLM 流水线，因此插件无从得知是哪个会话。这条路径必须有一个非空值，否则上游一律 `400 MissingSessionID`——该值由插件保证：填了就用填的，留空就现生成一个随机 UUID。
 
-> 小工具：插件提供了一个页面 **`会话默认值`**（WebUI 插件详情页里打开），可以直接改这个值，并有一个「随机 UUID」按钮一键生成。
+**想要随机值怎么操作**：把 `contextless_session_id` 清空，或打开 `random_contextless_value` 开关，两者等效（都是每次请求现生成 UUID）。AstrBot 的配置表单只渲染文本框、开关这类固定控件，**插件无法在其中插入自定义按钮**（见第 7 节），所以「生成随机值」这一步由插件在请求时完成，不需要你手填。
 
 **三种匹配方式怎么选**：
 
@@ -269,6 +269,7 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 - **会话标识取不到时省略该头**：当三个会话键来源全部为空、取不到可用会话标识时，插件会**省略**该头（不注入），并且**不会**退化成某个固定常量值。这是刻意设计：宁可少发一个头，也不让所有异常请求共用一个 ID——后者既没有缓存收益，又会制造上游风控特征。
 - **大小写不宽容**：`custom_headers` 中该头必须使用规范大小写 `X-Opencode-Session`；写成其它形式会出站重复头、覆盖结果未定义（见第 2.1 节）。
 - **注入范围按 `match_mode` 匹配**：默认按 `base_url` 匹配 `opencode`（见第 4.3 节）。**走自建中转时必须改成 `provider_id`**，否则中转的内网地址匹配不上、该头整个缺失，上游会返回 `400 MissingSessionID`。若拿不准就把 `host_keywords` 清空（全部注入）。
+- **配置表单里没有「随机」按钮**：AstrBot 的 `_conf_schema.json` 只能渲染文本框、开关、下拉、列表等固定控件；少数特殊控件由前端 `_special` 硬编码白名单决定，官方文档明确写着这些属于内部实现、**请勿在插件中使用**（`docs/zh/dev/star/guides/plugin-config.md:100`）。所以本插件不往配置页塞按钮——想要随机值，把 `contextless_session_id` 留空或打开 `random_contextless_value` 即可（见第 4.3 节），UUID 由插件在请求时现生成，不需要你手填。
 
 ---
 
@@ -281,7 +282,7 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 | 重载了但行为没变化 | 先确认真的重载成功（卡片状态、日志无报错）；必要时重启 AstrBot 进程。 |
 | webhook.site 收不到任何请求 | 说明请求根本没发出去：检查该 provider 的 `api_base` 是否填对、`api_key` 是否非空、AstrBot 是否确实路由到了这个 provider。 |
 | 收到了请求，但找不到 `x-opencode-session` | 该 provider 类型不在覆盖范围内（见第 7 节）；或请求没走 LLM provider 链路。 |
-| WebUI 点「测试」报 `400 MissingSessionID`，但对话正常 | 模型列表由客户端默认值兜底（见第 1.3 节）。请确认 `contextless_session_id` 非空、以及 `_conf_schema.json` 已随插件一起更新（**升级到 v1.3.0 或更高**）。 |
+| WebUI 点「测试」报 `400 MissingSessionID`，但对话正常 | 模型列表由客户端默认值兜底（见第 1.3 节）。请确认 `_conf_schema.json` 已随插件一起更新（**v1.3.0 或更高**）并重载过插件；这条路径的头值由插件保证非空，`contextless_session_id` 留空时也会现生成随机值。 |
 | 头存在，但值总是同一个 | 检查是否在 `custom_headers` 里写死了 `X-Opencode-Session`（见第 2 节）。在**规范大小写**下插件会在出站时无条件覆盖该头，所以正常情况下你看到的不会是写死的那串；如果看到的恰好就是写死值，说明插件没有加载成功、注入链路没生效，或该头被写成了非规范大小写（见下一行），请先按规范大小写配置或直接删掉该配置项后重来。 |
 | 插件装了但缓存亲和性没效果 / 抓包看到重复的 session 头 | `custom_headers` 中该头使用了**非规范大小写**（如 `x-opencode-session`、`X-OPENCODE-SESSION`），导致 SDK 精确键合并不上、出站出现两个头（实测值形如 `['HARDCODED', 'cid-lower']`）。此时**插件无法保证覆盖成功、结果未定义**：插件的值在写死值之后，但上游取首值还是末值取决于实现（httpx 标量取末值，许多反向代理 / 服务端**取首值**）。处理：改为规范大小写 `X-Opencode-Session`，或从 `custom_headers` 中删除该配置项。插件会就此打一条英文 warning（每个 provider 实例最多一次），但不会替你改配置。 |
 | 抓包发现该头整个缺失（不是重复） | 两种情况，按可能性排序：①`match_mode` 选的是 `base_url` 而该 provider 的地址不匹配 `host_keywords`（**走自建中转最常见的坑**，改成 `provider_id` 即可，见第 4.3 节）；②本次请求三个会话键来源全为空，插件按设计**省略**该头（见第 7 节）。插件日志会以 debug 级记录匹配用的字段与值，一看即知。 |
