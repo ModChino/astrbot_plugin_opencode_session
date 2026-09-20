@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "运行时请求流程：X-Opencode-Session 如何附加到 LLM 请求",
+    "output": "docs/request-flow.html",
+    "viewBox": [1240, 515],
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "conversation",
+        "label": "正常对话",
+        "focus": ["user", "astrbot", "plugin", "provider", "sdk", "upstream"],
+        "note": "钩子推导出 Conversation.cid，包装器把它写进这次请求的 extra_headers。"
+      },
+      {
+        "id": "unmatched",
+        "label": "不匹配的提供商",
+        "focus": ["plugin", "sdk"],
+        "note": "match_mode 判定不通过时，这把头既不在 extra_headers 里，也不在客户端默认值里。"
+      },
+      {
+        "id": "model-test",
+        "label": "WebUI 测试按钮",
+        "focus": ["plugin", "sdk", "upstream"],
+        "note": "临时新建的 provider 靠 base_url 白名单拿到默认值，测试才不会 400。"
+      }
+    ]
+  },
+  "participants": [
+    { "id": "user", "type": "external", "label": "用户 / WebUI", "sublabel": "消息入口" },
+    { "id": "astrbot", "type": "backend", "label": "AstrBot 核心", "sublabel": "事件与 provider 管理" },
+    { "id": "plugin", "type": "backend", "label": "本插件", "sublabel": "钩子 + 包装器" },
+    { "id": "provider", "type": "backend", "label": "Provider 实例", "sublabel": "OpenAI 兼容" },
+    { "id": "sdk", "type": "backend", "label": "OpenAI SDK client", "sublabel": "default / extra headers" },
+    { "id": "upstream", "type": "cloud", "label": "上游", "sublabel": "OpenCode Go / 自建中转" }
+  ],
+  "segments": [
+    { "from": 168, "to": 388, "label": "正常对话：命中则注入会话 cid" },
+    { "from": 394, "to": 458, "label": "默认值兜底" }
+  ],
+  "messages": [
+    {
+      "id": "msg-inbound",
+      "from": "user",
+      "to": "astrbot",
+      "y": 190,
+      "label": "发送一条消息",
+      "variant": "default"
+    },
+    {
+      "id": "msg-hook",
+      "from": "astrbot",
+      "to": "plugin",
+      "y": 220,
+      "label": "on_llm_request(event, req)",
+      "variant": "emphasis",
+      "note": "从 event.conversation.cid 推导会话 ID，并把 provider 的 create 包装起来"
+    },
+    {
+      "id": "msg-text-chat",
+      "from": "astrbot",
+      "to": "provider",
+      "y": 250,
+      "label": "text_chat(prompt, session_id)",
+      "variant": "default"
+    },
+    {
+      "id": "msg-create",
+      "from": "provider",
+      "to": "plugin",
+      "y": 280,
+      "label": "chat.completions.create()",
+      "variant": "default"
+    },
+    {
+      "id": "msg-inject",
+      "from": "plugin",
+      "to": "sdk",
+      "y": 310,
+      "label": "命中：extra_headers[X-Opencode-Session] = cid",
+      "variant": "emphasis"
+    },
+    {
+      "id": "msg-post",
+      "from": "sdk",
+      "to": "upstream",
+      "y": 340,
+      "label": "POST /chat/completions（带该头）",
+      "variant": "emphasis"
+    },
+    {
+      "id": "msg-200",
+      "from": "upstream",
+      "to": "sdk",
+      "y": 370,
+      "label": "200，命中 GPU 缓存",
+      "variant": "return"
+    },
+    {
+      "id": "msg-skip",
+      "from": "plugin",
+      "to": "sdk",
+      "y": 400,
+      "label": "未命中：不写该头，原样放行",
+      "variant": "dashed"
+    },
+    {
+      "id": "msg-ctor",
+      "from": "plugin",
+      "to": "sdk",
+      "y": 430,
+      "label": "WebUI 测试：补丁按 base_url 装入默认头",
+      "variant": "dashed",
+      "note": "测试每次都临时新建 provider 与 client，插件来不及包装它；这条路径随后请求 GET /models"
+    }
+  ],
+  "activations": [
+    { "participant": "astrbot", "from": 216, "to": 376, "type": "backend" },
+    { "participant": "plugin", "from": 216, "to": 316, "type": "backend" },
+    { "participant": "provider", "from": 246, "to": 286, "type": "backend" },
+    { "participant": "sdk", "from": 306, "to": 376, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "正常对话",
+      "items": [
+        "会话 ID 取自 Conversation.cid，同一对话链内不变",
+        "写在 per-call extra_headers，覆盖客户端默认值"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "不匹配的提供商",
+      "items": [
+        "既不写 extra_headers，也不装默认值",
+        "对话和测试都不带这把头"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "WebUI 测试按钮",
+      "items": [
+        "临时新建 provider，插件来不及包装",
+        "补丁按 base_url 白名单装入默认值"
+      ]
+    }
+  ]
+}
