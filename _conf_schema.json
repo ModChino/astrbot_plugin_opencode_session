@@ -13,7 +13,7 @@
       "按提供商 ID",
       "按提供商类型"
     ],
-    "hint": "选择用哪个字段去匹配下面的关键字，三选一，只比这一个字段。base_url：提供商配置里的地址（严格；若请求经过你自己的中转，地址是内网 IP、与上游域名无关，会匹配不到）。provider_id：形如 opencode/deepseek-v4-flash，经过中转时通常仍带 opencode，**走自建中转请选这项**。provider_type：形如 chat_completion。"
+    "hint": "选择用哪个字段去匹配下面的关键字，三选一，只比这一个字段。base_url：提供商配置里的地址（严格；若请求经过你自己的中转，地址是内网 IP、与上游域名无关，会匹配不到）。provider_id：形如 opencode/deepseek-v4-flash，经过中转时通常仍带 opencode，**走自建中转请选这项**。provider_type：形如 chat_completion。这个筛选决定该头**只发给谁**：没命中的提供商一个头都不会带（对话和测试都不带）。"
   },
   "host_keywords": {
     "description": "匹配关键字",

@@ -20,6 +20,7 @@ import functools
 import inspect
 import logging
 import uuid
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from astrbot.api.event import filter
@@ -81,6 +82,28 @@ _HTTP_MARK_ATTR = "__oc_session_http_marked__"
 
 _wrap_targets: list[Any] = []
 """Providers this plugin has wrapped, used to reach their httpx clients."""
+
+_INJECT_BASE_URLS: set[str] = set()
+"""Normalised base URLs of the providers that passed the match filter.
+
+The ``AsyncOpenAI.__init__`` patch fires before any provider is known, so it
+cannot evaluate ``match_mode``. It consults this set instead, which
+``wrap_provider`` fills from providers that did pass the filter.
+"""
+
+_INJECT_URLS_READY: bool = False
+"""False until ``initialize`` has scanned every known provider once.
+
+An empty set is ambiguous -- "nothing matches" and "not scanned yet" look the
+same -- so the guard only trusts the set once this flag is set.
+"""
+
+_DEFAULT_WRITTEN: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Clients this plugin gave a contextless default, and the exact value written.
+
+Lets a later config change take the default back without ever touching a header
+the user configured themselves. Keys are weak so a dropped client is forgotten.
+"""
 
 _openai_original_init: Any = None
 _openai_patched_cls: Any = None
@@ -399,6 +422,61 @@ def _sdk_clients() -> list[Any]:
     return clients
 
 
+def _normalize_url(url: Any) -> str:
+    """Normalise a base URL so set membership ignores case and a trailing slash.
+
+    Args:
+        url: A URL string, an ``httpx.URL``, or anything else; ``None`` is "".
+
+    Returns:
+        The lower-cased URL without a trailing slash.
+    """
+    return str(url or "").strip().rstrip("/").lower()
+
+
+def _url_allows_default(url: Any) -> bool:
+    """Decide whether a client at ``url`` may carry the contextless default.
+
+    The dashboard's throwaway client inherits the base URL of the provider being
+    tested, so "is this URL one of the matched providers' URLs" is exactly the
+    question that separates a genuine model-list test from an unrelated provider.
+
+    Args:
+        url: The base URL of the client about to receive the default.
+
+    Returns:
+        True while the scan has not run yet (keep the historical catch-all
+        behaviour), otherwise True only for matched providers' URLs.
+    """
+    if not _INJECT_URLS_READY:
+        return True
+    return _normalize_url(url) in _INJECT_BASE_URLS
+
+
+def _user_configured_the_header(provider: Any) -> bool:
+    """Whether the user's own configuration declares this header.
+
+    ``provider.provider_config`` holds the raw mapping from the WebUI, while
+    ``provider.custom_headers`` is what ``build_provider_headers`` derived from it
+    (``astrbot/core/provider/headers.py:15``) and what this plugin writes into --
+    so only the former can tell the user's value apart from ours.
+
+    Args:
+        provider: The provider owning the client, or ``None`` when unknown.
+
+    Returns:
+        True when the header is the user's, or when that cannot be determined.
+    """
+    raw = getattr(provider, "provider_config", None)
+    if not isinstance(raw, dict):
+        return True
+    configured = raw.get("custom_headers")
+    if not isinstance(configured, dict):
+        return False
+    name = (TARGET_HEADER or HEADER_NAME).lower()
+    return any(str(key).lower() == name for key in configured)
+
+
 def _install_on_client(client: Any) -> None:
     """Give one SDK client a default value for the session header.
 
@@ -416,6 +494,10 @@ def _install_on_client(client: Any) -> None:
     """
     if not TRANSPORT_INJECT:
         return
+    # All three call sites (wrap_provider, the ctor patch, install_http_injector)
+    # funnel through here, so the scope filter lives here and nowhere else.
+    if not _url_allows_default(getattr(client, "base_url", "")):
+        return
     headers = getattr(client, "_custom_headers", None)
     if not isinstance(headers, dict):
         return
@@ -427,7 +509,47 @@ def _install_on_client(client: Any) -> None:
     for name in headers:
         if str(name).lower() == header_name.lower():
             return
-    headers[header_name] = _contextless_key()
+    value = _contextless_key()
+    headers[header_name] = value
+    try:
+        _DEFAULT_WRITTEN[client] = (header_name, value)
+    except TypeError:
+        logger.debug("client is not weak-referenceable, so the default is untracked")
+
+
+def _uninstall_on_client(client: Any, provider: Any = None) -> None:
+    """Take back a default this plugin wrote, leaving the user's own headers alone.
+
+    Long-lived clients outlive the module that tagged them, so without this a
+    reload or a scope change would leave them sending a header that no longer
+    matches the configured filter.
+
+    Args:
+        client: An ``AsyncOpenAI``-alike this plugin may have tagged.
+        provider: The provider owning the client, used to read the user's config.
+    """
+    try:
+        written = _DEFAULT_WRITTEN.pop(client, None)
+    except TypeError:
+        written = None
+    headers = getattr(client, "_custom_headers", None)
+    if not isinstance(headers, dict):
+        return
+    if written:
+        written_name, written_value = written
+        if headers.get(written_name) == written_value:
+            del headers[written_name]
+        return
+    # No record: the tag came from an earlier generation of this module, whose
+    # bookkeeping died with it. Only remove a value the user did not configure.
+    if _user_configured_the_header(provider):
+        return
+    name = (TARGET_HEADER or HEADER_NAME).lower()
+    stale = [key for key in headers if str(key).lower() == name]
+    for key in stale:
+        del headers[key]
+    if stale:
+        logger.info("removed a stale %s default from an unmatched client", name)
 
 
 def _install_create(
@@ -615,8 +737,11 @@ def wrap_provider(provider: Any) -> bool:
         setattr(provider, ORIGINALS_ATTR, originals)
 
     wrapped = False
+    matched = False
     client = getattr(provider, "client", None)
     for chain, holder, current in _iter_creates(client):
+        if _should_inject(provider, holder):
+            matched = True
         _install_create(
             holder,
             ".".join((*chain, "create")),
@@ -634,9 +759,20 @@ def wrap_provider(provider: Any) -> bool:
         setattr(provider, WRAP_FLAG, True)
         if provider not in _wrap_targets:
             _wrap_targets.append(provider)
-        # Tag the httpx layer too, so requests that never reach a wrapped method
-        # (the dashboard's throwaway model-list provider) still carry the header.
-        _install_on_client(client)
+        if client is not None and matched:
+            # Remember this base URL. The ctor patch cannot see the provider, so
+            # it uses this set to tell a matched provider's client -- including
+            # the dashboard's throwaway instance -- from an unrelated one.
+            _INJECT_BASE_URLS.add(_normalize_url(getattr(client, "base_url", "")))
+            # Tag the httpx layer too, so requests that never reach a wrapped
+            # method (the dashboard's throwaway model-list provider) still carry
+            # the header. Only matched providers are tagged here: during the
+            # initial scan ``_INJECT_URLS_READY`` is still False, so the guard
+            # inside would let an unrelated provider through.
+            _install_on_client(client)
+        elif client is not None:
+            # Unmatched: nothing this plugin wrote should stay on that client.
+            _uninstall_on_client(client, provider)
     _warn_case_variant_headers(provider)
     return wrapped
 
@@ -753,11 +889,16 @@ class OpencodeSessionPlugin(Star):
 
         The transport patch is what covers the dashboard's model-list test, which
         builds its own throwaway provider instance instead of reusing one of the
-        providers wrapped here.
+        providers wrapped here. Which base URLs that default may reach is decided
+        by the provider scan below, so the scan has to happen first.
         """
+        global _INJECT_URLS_READY
         try:
+            _INJECT_BASE_URLS.clear()
+            _INJECT_URLS_READY = False
             for provider in self.context.get_all_providers():
                 wrap_provider(provider)
+            _INJECT_URLS_READY = True
             install_http_injector()
         except Exception:
             logger.debug("opencode session prewrap skipped", exc_info=True)

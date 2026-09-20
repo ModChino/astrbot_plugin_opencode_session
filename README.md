@@ -38,7 +38,7 @@ AstrBot 的自定义请求头是在 **provider 初始化时构建一次**的静�
 注入分**两层**，覆盖两类情形：
 
 1. **按对话链注入**：`on_llm_request` 钩子记录当前会话的 `cid`，随后被包装的 `create` 调用把它写进本次请求的 `extra_headers`。这样同一对话的多轮请求共用一个值。
-2. **客户端默认值**：插件给每个 SDK client 的 `default_headers` 写入一个默认值。**凡是插件没有包装到的请求路径，都由这个默认值兜底**——最典型的是 WebUI 里点「测试」拉取模型列表：AstrBot 会临时新建一个 provider 实例再直接调用（`dashboard/services/config_service.py:1694`），插件完全没有机会包装它。
+2. **客户端默认值**：插件给**匹配 `match_mode` 的** SDK client 的 `default_headers` 写入一个默认值。**凡是插件没有包装到的请求路径，都由这个默认值兜底**——最典型的是 WebUI 里点「测试」拉取模型列表：AstrBot 会临时新建一个 provider 实例再直接调用（`dashboard/services/config_service.py:1694`），插件完全没有机会包装它。**不匹配的 provider 不会拿到这个默认值**，无论是对话还是测试（见第 4.3 节）。
 
 被包装的**对话出站路径**有两条，外加 `text_chat` / `text_chat_stream` 兜底：
 
@@ -194,9 +194,11 @@ cp -r ./astrbot_plugin_opencode_session /path/to/AstrBot/data/plugins/
 
 **为什么需要「无会话上下文」的默认值**：WebUI 里拉取模型列表的测试会**临时新建一个 provider 实例**（`dashboard/services/config_service.py:1694`）再直接调 `get_models()`，它不进入 LLM 流水线，因此插件无从得知是哪个会话。这条路径必须有一个非空值，否则上游一律 `400 MissingSessionID`——该值由插件保证：填了就用填的，留空就现生成一个随机 UUID。
 
-> 这个默认值写在 SDK 客户端的 `default_headers` 上（`main.py:430`），只在该客户端**第一次**被包装时写入一次（`:427-429` 有同名键就跳过）。所以它的粒度是**每个客户端**，不是每次请求。**对话链的取值不受它影响**：正常对话走 per-call `extra_headers`（`main.py:459`），用的是 `Conversation.cid`，在同名键上覆盖客户端默认值。
+> 这个默认值写在 SDK 客户端的 `default_headers` 上（`main.py:480`），只在该客户端**第一次**被包装时写入一次（同名键已存在就跳过），所以粒度是**每个客户端**，不是每次请求。**对话链的取值不受它影响**：正常对话走 per-call `extra_headers`（`main.py:581`），用的是 `Conversation.cid`，在同名键上覆盖客户端默认值。
 >
-> 已知边界：客户端默认值是在 `AsyncOpenAI.__init__` 补丁里装的（`main.py:357`），那一刻拿不到 provider，因此**每个** SDK 客户端都会装。匹配 `match_mode` 的 provider 会被对话链覆盖；**不匹配的 provider 没人覆盖它**，其请求也会带上这个头。这是 dashboard 测试兜底的代价，属已知限制。
+> **它同样遵守 `match_mode`**：`AsyncOpenAI.__init__` 补丁运行时还不知道 provider（`main.py:380`），所以插件改用**匹配到的 provider 的 base_url** 划范围（`_url_allows_default`，`main.py:437`）。dashboard 的 throwaway 实例继承被测试 provider 的地址，因此测试按钮照常工作；而**不匹配的 provider 一个头都不会带**——对话和测试都不带。
+>
+> 两个已知边界：判定依据是**地址**，所以两个 provider 若共用同一个 `base_url`，会被同等对待；另外改了筛选后重载插件时，插件会把之前写在客户端上的旧值撤掉（`_uninstall_on_client`，`main.py:520`），但**绝不碰你自己在 `custom_headers` 里配的同名头**。
 
 **想要随机值怎么操作**：把 `contextless_session_id` 清空，或打开 `random_contextless_value` 开关，两者等效（都是「新建客户端时现生成一个 UUID」）。AstrBot 的配置表单只渲染文本框、开关这类固定控件，**插件无法在其中插入自定义按钮**（见第 7 节），所以「生成随机值」这一步由插件在建客户端时完成，不需要你手填。
 
