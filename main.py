@@ -54,9 +54,8 @@ MATCH_MODE: str = "base_url"
 HOST_KEYWORDS: tuple[str, ...] = ("opencode",)
 MATCH_MODES: tuple[str, ...] = ("base_url", "provider_id", "provider_type")
 TRANSPORT_INJECT: bool = True
-CONTEXTLESS_SESSION_ID: str = "test"
-RANDOM_CONTEXTLESS: bool = False
-"""When set, every contextless request gets its own fresh UUID."""
+CONTEXTLESS_SESSION_ID: str = ""
+"""Value for contextless requests; blank means a fresh UUID per new client."""
 
 SESSION_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
     "opencode_session_key",
@@ -320,19 +319,13 @@ def _contextless_key() -> str:
     and it must still send a non-empty value because upstream answers
     ``400 MissingSessionID`` otherwise.
 
-    Three modes, in order of precedence:
-
-    1. ``random_contextless_value`` on -- a fresh UUID per request. This never
-       collides with a real conversation's cache and never makes unrelated test
-       requests look like one session.
-    2. a configured ``contextless_session_id``.
-    3. a random UUID, when the configured value is blank.
+    A configured ``contextless_session_id`` wins. A blank one -- the shipped
+    default -- yields a fresh UUID, so unrelated test clients never share a
+    session and never collide with a real conversation's cache.
 
     Returns:
         A non-empty header-safe string.
     """
-    if RANDOM_CONTEXTLESS:
-        return str(uuid.uuid4())
     configured = _clean(CONTEXTLESS_SESSION_ID)
     return configured if configured else str(uuid.uuid4())
 
@@ -820,7 +813,7 @@ class OpencodeSessionPlugin(Star):
         """
         super().__init__(context)
         global TARGET_HEADER, MATCH_MODE, HOST_KEYWORDS
-        global TRANSPORT_INJECT, CONTEXTLESS_SESSION_ID, RANDOM_CONTEXTLESS
+        global TRANSPORT_INJECT, CONTEXTLESS_SESSION_ID
 
         if isinstance(config, dict):
             header = config.get("target_header")
@@ -847,17 +840,14 @@ class OpencodeSessionPlugin(Star):
                     fallback.strip() if isinstance(fallback, str) else ""
                 )
 
-            RANDOM_CONTEXTLESS = bool(config.get("random_contextless_value", False))
-
         logger.debug(
             "opencode session injection target: header=%s match_mode=%s keywords=%s "
-            "transport_inject=%s contextless_session_id=%r random_contextless=%s",
+            "transport_inject=%s contextless_session_id=%r",
             TARGET_HEADER,
             MATCH_MODE,
             HOST_KEYWORDS,
             TRANSPORT_INJECT,
             CONTEXTLESS_SESSION_ID,
-            RANDOM_CONTEXTLESS,
         )
 
     @filter.on_llm_request()

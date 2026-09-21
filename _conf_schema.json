@@ -26,14 +26,8 @@
   "contextless_session_id": {
     "description": "无会话上下文时使用的值",
     "type": "string",
-    "default": "test",
-    "hint": "用于「没有对话链」的请求（例如 WebUI 里点「测试」拉取模型列表）。填固定值就始终用它；**留空则在新建客户端时现生成一个随机 UUID**（不会因此报 400 MissingSessionID）。想让这个值随机，也可以直接打开下一项开关。"
-  },
-  "random_contextless_value": {
-    "description": "无会话请求的默认值随机化",
-    "type": "bool",
-    "default": false,
-    "hint": "打开后，每个新建的 SDK 客户端会分到一个随机 UUID，取代上面的固定值。WebUI 的模型列表测试每次都新建客户端，所以每次都不同；同一个客户端复用期间取值不变。打开后上面的默认值仅在显示上保留、不再使用。"
+    "default": "",
+    "hint": "用于「没有对话链」的请求（例如 WebUI 里点「测试」拉取模型列表）。**留空（默认）则在新建 SDK 客户端时现生成一个随机 UUID**；填入内容则始终使用这个固定值。两种情况插件都保证非空，因此不会报 400 MissingSessionID。"
   },
   "target_header": {
     "description": "注入的请求头名称",

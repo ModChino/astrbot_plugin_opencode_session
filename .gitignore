@@ -22,3 +22,6 @@ Thumbs.db
 tests/
 REQUIREMENTS.md
 VERIFICATION.md
+
+# 本地 agent 指令：只在本工作区生效，不随仓库分发
+AGENTS.md
