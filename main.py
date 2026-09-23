@@ -11,6 +11,14 @@ individual request through the SDK's per-call ``extra_headers`` argument. Shared
 provider/client state -- the configured headers of the provider and the client's
 private default header mapping -- is only ever read, never written, so concurrent
 conversations cannot leak into each other's requests.
+
+A restart exposes the ordering detail this plugin has to work around: AstrBot
+instantiates the plugins before the providers (``astrbot/core/core_lifecycle.py:261``
+runs ``plugin_manager.reload()``, ``:265`` runs ``provider_manager.initialize()``),
+so ``initialize`` always runs while ``get_all_providers()`` is still empty on a
+restart. That is why the provider scan also runs from ``on_astrbot_loaded`` (every
+manager is up, no message has been dispatched yet) and from ``on_llm_request``,
+and why a scan that saw no provider at all never counts as a finished one.
 """
 
 from __future__ import annotations
@@ -91,10 +99,15 @@ cannot evaluate ``match_mode``. It consults this set instead, which
 """
 
 _INJECT_URLS_READY: bool = False
-"""False until ``initialize`` has scanned every known provider once.
+"""False until a scan has actually seen providers.
 
-An empty set is ambiguous -- "nothing matches" and "not scanned yet" look the
-same -- so the guard only trusts the set once this flag is set.
+An empty set is ambiguous -- "nothing matches" and "nothing exists yet" look the
+same -- so the guard only trusts the set once this flag is set. On a restart the
+first scan runs before AstrBot instantiates its providers, so this stays False
+until ``on_astrbot_loaded`` (or the first ``on_llm_request``) rescans: a scan
+that saw nothing must never be mistaken for a completed one, or the matched-URL
+set would freeze at "empty" and every later client -- including the one the
+image-description path depends on -- would be refused a default.
 """
 
 _DEFAULT_WRITTEN: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -438,8 +451,12 @@ def _url_allows_default(url: Any) -> bool:
         url: The base URL of the client about to receive the default.
 
     Returns:
-        True while the scan has not run yet (keep the historical catch-all
-        behaviour), otherwise True only for matched providers' URLs.
+        True while no scan has seen a provider yet (the catch-all window between
+        loading the plugin and AstrBot finishing its own startup, during which a
+        new client's provider cannot be attributed any other way), otherwise True
+        only for matched providers' URLs. The window closes on the first scan that
+        sees something, and that scan reclaims what it tagged: every unmatched
+        provider goes through ``_uninstall_on_client``.
     """
     if not _INJECT_URLS_READY:
         return True
@@ -706,6 +723,65 @@ def _warn_case_variant_headers(provider: Any) -> None:
     )
 
 
+def _held_providers(context: Any) -> list[Any]:
+    """Every provider instance AstrBot currently holds, deduplicated.
+
+    ``Context.get_all_providers()`` only ever returns the chat-completion
+    providers (``astrbot/core/star/context.py:440`` returns
+    ``provider_manager.provider_insts``). The manager's ``inst_map`` is the wider
+    registry -- every instantiated provider, whatever its type -- so the direct
+    ``text_chat`` paths stay covered even for a provider the chat-only list does
+    not expose.
+
+    Args:
+        context: AstrBot plugin context.
+
+    Returns:
+        The providers, in discovery order, without duplicates.
+    """
+    candidates: list[Any] = []
+    try:
+        candidates.extend(context.get_all_providers() or [])
+    except Exception:
+        logger.debug("could not list the chat providers", exc_info=True)
+    manager = getattr(context, "provider_manager", None)
+    inst_map = getattr(manager, "inst_map", None)
+    if isinstance(inst_map, dict):
+        candidates.extend(inst_map.values())
+    providers: list[Any] = []
+    for provider in candidates:
+        if provider is not None and provider not in providers:
+            providers.append(provider)
+    return providers
+
+
+def _sync_providers(context: Any) -> None:
+    """Wrap every provider AstrBot holds and (re)decide the base-URL scope.
+
+    The plugin runs before the providers on every AstrBot start
+    (``core/core_lifecycle.py:261`` instantiates the plugins, ``:265`` the
+    providers), so the scan is retried from every point where the provider set may
+    have grown: ``initialize``, ``on_astrbot_loaded`` (which fires once loading is
+    done, still before the event bus dispatches a message) and ``on_llm_request``
+    (for providers that appear later, when no startup hook ran).
+
+    A scan that finds nothing leaves ``_INJECT_URLS_READY`` False on purpose: an
+    empty URL set means either "nothing matched" or "no provider exists yet", and
+    only the first may gate a client.
+
+    Args:
+        context: AstrBot plugin context.
+    """
+    global _INJECT_URLS_READY
+    providers = _held_providers(context)
+    for provider in providers:
+        wrap_provider(provider)
+    if providers:
+        # Only now is _INJECT_BASE_URLS a complete picture of the matched
+        # providers, so only now may it gate the clients built after it.
+        _INJECT_URLS_READY = True
+
+
 def wrap_provider(provider: Any) -> bool:
     """Idempotently install the header injection wrappers on one provider.
 
@@ -748,24 +824,27 @@ def wrap_provider(provider: Any) -> bool:
         if callable(method):
             _install_text_method(provider, name, method, originals)
             wrapped = True
+    if client is not None and matched:
+        # Remember this base URL. The ctor patch cannot see the provider, so it
+        # uses this set to tell a matched provider's client -- including the
+        # dashboard's throwaway instance -- from an unrelated one.
+        _INJECT_BASE_URLS.add(_normalize_url(getattr(client, "base_url", "")))
+        # Tag the httpx layer too, so requests that never reach a wrapped method
+        # (the dashboard's throwaway model-list provider) still carry the header.
+        # Only matched providers are tagged here: during the initial scan
+        # ``_INJECT_URLS_READY`` is still False, so the guard inside would let an
+        # unrelated provider through.
+        _install_on_client(client)
+    elif client is not None:
+        # Unmatched: nothing this plugin wrote should stay on that client. This
+        # is deliberately outside the ``wrapped`` branch: a client the ctor patch
+        # tagged during the catch-all window has to be reclaimed even when the
+        # provider exposes nothing wrappable at all.
+        _uninstall_on_client(client, provider)
     if wrapped:
         setattr(provider, WRAP_FLAG, True)
         if provider not in _wrap_targets:
             _wrap_targets.append(provider)
-        if client is not None and matched:
-            # Remember this base URL. The ctor patch cannot see the provider, so
-            # it uses this set to tell a matched provider's client -- including
-            # the dashboard's throwaway instance -- from an unrelated one.
-            _INJECT_BASE_URLS.add(_normalize_url(getattr(client, "base_url", "")))
-            # Tag the httpx layer too, so requests that never reach a wrapped
-            # method (the dashboard's throwaway model-list provider) still carry
-            # the header. Only matched providers are tagged here: during the
-            # initial scan ``_INJECT_URLS_READY`` is still False, so the guard
-            # inside would let an unrelated provider through.
-            _install_on_client(client)
-        elif client is not None:
-            # Unmatched: nothing this plugin wrote should stay on that client.
-            _uninstall_on_client(client, provider)
     _warn_case_variant_headers(provider)
     return wrapped
 
@@ -850,6 +929,27 @@ class OpencodeSessionPlugin(Star):
             CONTEXTLESS_SESSION_ID,
         )
 
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self) -> None:
+        """Finish the provider scan ``initialize`` had to run too early for.
+
+        AstrBot loads plugins before providers (``core_lifecycle.py:261`` vs ``:265``),
+        so on a restart ``initialize`` legitimately sees no provider at all. This
+        hook fires once everything is loaded and still before the event bus
+        delivers a message, so the wrappers and the client defaults land on the
+        providers that arrived after the plugin. Without it the paths that never
+        reach the LLM pipeline -- the image description and the WebUI provider
+        test -- would only ever be fixed by an unrelated message or a manual
+        plugin reload.
+        """
+        try:
+            _sync_providers(self.context)
+            # Idempotent, and the only chance to cover clients built before this
+            # hook if a provider scan failed during ``initialize``.
+            install_http_injector()
+        except Exception:
+            logger.debug("opencode session rescan skipped", exc_info=True)
+
     @filter.on_llm_request()
     async def on_llm_request(
         self,
@@ -869,8 +969,9 @@ class OpencodeSessionPlugin(Star):
             # expose the previous conversation's key to it.
             SESSION_KEY.set(key)
             SESSION_SID.set(session_id)
-            for provider in self.context.get_all_providers():
-                wrap_provider(provider)
+            # Also completes a scan that has not seen a provider yet (restart),
+            # and keeps it complete for providers added while AstrBot runs.
+            _sync_providers(self.context)
         except Exception:
             logger.debug("opencode session injection skipped", exc_info=True)
 
@@ -881,14 +982,19 @@ class OpencodeSessionPlugin(Star):
         builds its own throwaway provider instance instead of reusing one of the
         providers wrapped here. Which base URLs that default may reach is decided
         by the provider scan below, so the scan has to happen first.
+
+        On a restart the scan finds nothing: AstrBot instantiates the providers
+        after the plugins, so ``get_all_providers()`` is still empty here. That must
+        not be recorded as a completed scan -- the matched-URL set would stay empty
+        and ``_url_allows_default`` would refuse every client built afterwards, which
+        is exactly how the image-description path lost its header. ``on_astrbot_loaded``
+        finishes the scan once the providers exist.
         """
         global _INJECT_URLS_READY
         try:
             _INJECT_BASE_URLS.clear()
             _INJECT_URLS_READY = False
-            for provider in self.context.get_all_providers():
-                wrap_provider(provider)
-            _INJECT_URLS_READY = True
+            _sync_providers(self.context)
             install_http_injector()
         except Exception:
             logger.debug("opencode session prewrap skipped", exc_info=True)
